@@ -17,25 +17,30 @@ class Subgraph:
         self.generating_concepts: Dict[str, int] = {}
 
     def _new_node(self, node_type: str, time: float, feat: np.ndarray) -> NodeId:
-        nid = self._next_id
+        """Create a new node"""
+        next_id = self._next_id
         self._next_id += 1
-        self.nodes[nid] = Node(id=nid, node_type=node_type, time=float(time), feat=np.asarray(feat, dtype=float))
-        return nid
+        self.nodes[next_id] = Node(id=next_id, node_type=node_type, time=float(time), feat=np.asarray(feat, dtype=float))
+        return next_id
 
-    def _add_edge(self, source: NodeId, destination: NodeId, relation: str) -> None:
+    def _add_edge(self, source: NodeId, destination: NodeId, relation: str):
+        """Add an edge between given nodes"""
         self.edges.append(Edge(source=source, destination=destination, relation=relation))
         self.adj.setdefault(source, []).append((relation, destination))
 
     def create_root(self, time: float, feat: np.ndarray) -> NodeId:
+        """Create root node for subgraph"""
         rid = self._new_node(self.schema.root_type, time, feat)
         self.root = rid
         return rid
 
     @staticmethod
     def _pick_relation(relation_types: List[str], probs_row: np.ndarray, rng: np.random.Generator, strategy: Literal["mode", "sample"]) -> str:
+        # Pick relation with highest probability
         if strategy == "mode":
             return relation_types[int(np.argmax(probs_row))]
-        # sample
+        
+        # Sample relation using relation probablities as weights
         idx = int(rng.choice(len(relation_types), p=probs_row))
         return relation_types[idx]
 
@@ -53,62 +58,101 @@ class Subgraph:
         rng = rng or np.random.default_rng()
         L = generating_concept.L()
 
+        # Keep record of the generating concept used
         self.generating_concepts[generating_concept.name] = self.generating_concepts.get(generating_concept.name, 0) + int(instances)
 
+        # Generate correct number of instances
         for _ in range(int(instances)):
-            cur = self.root
+            
+            # Same root node
+            current = self.root
             root_time = self.nodes[self.root].time
-
-            cur_type = self.nodes[cur].node_type
+            current_type = self.nodes[current].node_type
 
             for k in range(L):
+                # Extract relation from concept
                 relation = self._pick_relation(generating_concept.relation_types, generating_concept.relation_probs[k], rng, relation_pick)
 
+                # Extract node type (not meaningful in current implementation)
                 if node_types_for_hops is not None:
                     destination_type = node_types_for_hops[k]
                 else:
-                    destination_type = self.schema.transitions[(cur_type, relation)]
+                    destination_type = self.schema.transitions[(current_type, relation)]
 
-                self.schema.check(cur_type, relation, destination_type)
+                # Ensure correctness of proposition
+                self.schema.check(current_type, relation, destination_type)
 
-                abs_dt = float(generating_concept.time_deltas[k])
-                t = float(root_time + abs_dt + rng.normal(0.0, time_noise_std))
+                # time delta 
+                time_delta = float(generating_concept.time_deltas[k])
+                time = float(root_time + time_delta + rng.normal(0.0, time_noise_std))
 
-                mu = generating_concept.feature_centroid[k + 1]
-                feat = mu + rng.normal(0.0, feat_noise_std, size=mu.shape)
+                # features
+                centroid = generating_concept.feature_centroid[k + 1]
+                features = centroid + rng.normal(0.0, feat_noise_std, size=centroid.shape)
 
-                nxt = self._new_node(destination_type, t, feat)
-                self._add_edge(cur, nxt, relation)
+                # add node and edge
+                nxt = self._new_node(destination_type, time, features)
+                self._add_edge(current, nxt, relation)
 
-                cur = nxt
-                cur_type = destination_type
+                # continue to next node
+                current = nxt
+                current_type = destination_type
 
-    def sample_paths(self, L: int) -> List[PathSample]:
+    def sample_paths(
+        self,
+        L: int,
+        n_samples: int = 128,
+        rng: np.random.Generator | None = None,
+    ) -> List[PathSample]:
+        """
+        Randomly sample path instances of hop-length L from the subgraph.
+        """
+        if rng is None:
+            rng = np.random.default_rng()
 
-        root_time = self.nodes[self.root].time
+        root_id = self.root
+        root_time = self.nodes[root_id].time  # seed reference time (t=0)
+
         samples: List[PathSample] = []
 
-        def dfs(u: NodeId, depth: int, relations: List[str], times: List[float], feats: List[np.ndarray]) -> None:
-            if depth == L:
+        # Sample required number of paths
+        for _ in range(n_samples):
+            current = root_id
+            relations: List[str] = []
+            times: List[float] = []
+            feats: List[np.ndarray] = []
+
+            for _depth in range(L):
+                out_edges = self.adj.get(current, [])
+                if not out_edges:
+                    # Dead end before reaching length L; discard this attempt.
+                    relations = []
+                    times = []
+                    feats = []
+                    break
+
+                # Choose a random outgoing edge uniformly.
+                idx = int(rng.integers(0, len(out_edges)))
+                relation, v = out_edges[idx]
+
+                relations.append(relation)
+                times.append(self.nodes[v].time - root_time)          # time offset from seed
+                feats.append(self.nodes[v].feature_embedding)         # node feature at this hop
+
+                current = v
+
+            # Add sample
+            if len(relations) == L:
                 samples.append(
                     PathSample(
-                        relation_sequence=relations.copy(),
+                        relation_sequence=relations,
                         time_vector=np.array(times, dtype=float),
                         feature_vector=np.stack(feats, axis=0),
                     )
                 )
-                return
-            for relation, v in self.adj.get(u, []):
-                relations.append(relation)
-                times.append(self.nodes[v].time - root_time)
-                feats.append(self.nodes[v].feature_embedding)
-                dfs(v, depth + 1, relations, times, feats)
-                feats.pop()
-                times.pop()
-                relations.pop()
 
-        dfs(self.root, 0, [], [], [])
         return samples
+
 
     @staticmethod
     def _relational_similarity(path_relations: List[str], hypothesis_concept: Concept) -> float:
