@@ -1,0 +1,10 @@
+kind,noise_std,evidence,gamma,tau
+accumulated_noise,0.0,0.6666666666666666,5.0,1.0
+accumulated_noise,0.125,0.6577949252026425,5.0,1.0
+accumulated_noise,0.25,0.6328047000587336,5.0,1.0
+accumulated_noise,0.375,0.5971860161142434,5.0,1.0
+accumulated_noise,0.5,0.5602017127732954,5.0,1.0
+accumulated_noise,0.625,0.5309796319129667,5.0,1.0
+accumulated_noise,0.75,0.513195963955471,5.0,1.0
+accumulated_noise,0.875,0.5046864364793896,5.0,1.0
+accumulated_noise,1.0,0.5014004355811593,5.0,1.0
