@@ -81,18 +81,11 @@ def test_smoke_evidence_in_range():
 # Tests that probe how evidence responds to temporal mismatches.
 # ============================================================
 
-def test_sensitivity_time_similarity_sweep_writes_curve():
+def test_sensitivity_time_similarity_sweep():
     """
-    Sweep time offset and measure evidence degradation.
+    Create 10 single path subgraphs, each with values further from ground truth and measure evidence score dropoff
     
     Hypothesis: As temporal mismatch increases, evidence should decrease
-    (assuming gamma > 0, tau > 0).
-    
-    Method:
-        1. Generate evidence with time-shifted concept (same structure/features)
-        2. Score against original concept
-        3. Record evidence at each offset
-        4. Verify non-increasing monotonicity
     """
     sch = make_schema()
     C = base_concept_r1r2(gamma=5.0, tau=1.0)
@@ -137,56 +130,132 @@ def test_sensitivity_time_similarity_sweep_writes_curve():
     print("offset -> evidence:", [(float(r["offset"]), float(r["evidence"])) for r in rows])
 
 
-def test_sensitivity_path_noise_accumulation_writes_curve():
+def test_sensitivity_path_noise_accumulation_same_concept():
     """
-    Measure evidence scores as we accumulate increasingly noisy paths based on the same concept.
+    Continue adding increasingly noisy base_concept paths and inspect change in evidence score
     
-    Hypothesis: Evidence should scale with number of matching instances, but degrade
-    as noise increases. This tests robustness to accumulated noisy evidence.
-    
-    Method:
-        1. Build graph with one perfect r1->r2 instance
-        2. Iteratively add more instances with increasing time noise
-        3. Score against original noise-free concept
-        4. Record evidence at each accumulation step
-        5. Verify evidence behavior under noise accumulation
+    hypothesis: the evidence score will initially dampen, then quickly level out due to overly noisy paths
     """
-    sch = make_schema()
-    C = base_concept_r1r2(gamma=5.0, tau=1.0)
+    schema = make_schema()
+    concept = base_concept_r1r2(gamma=5.0, tau=1.0)
 
-    # Sweep noise levels from 0 to 1.0 seconds
-    noise_levels = np.linspace(0.0, 1.0, 9)
+    # One shared graph for the entire sweep (keeps scores comparable)
+    graph = Subgraph(schema)
+    graph.create_root(time=0.0, feat=concept.feature_centroid[0])
+
+    # Start with a single clean instance as a baseline signal
+    graph.add_evidence(
+        concept,
+        rng=np.random.default_rng(0),
+        instances=1,
+        relation_pick="mode",
+        time_noise_std=0.0,
+        feat_noise_std=0.0,
+    )
+
+    noise_std_sweep = np.linspace(0.0, 1.0, 9)
+    instances_per_noise_level = 10
+
     rows: List[Dict[str, Any]] = []
+    total_instances = 1  # already added the clean baseline instance
 
-    for noise in noise_levels:
-        # Build graph with one perfect instance + noisy instances
-        planted = [
-            (C, dict(rng=np.random.default_rng(0), instances=1, rel_pick="mode", time_noise_std=0.0, feat_noise_std=0.0)),
-            (C, dict(rng=np.random.default_rng(1), instances=1, rel_pick="mode", time_noise_std=float(noise), feat_noise_std=0.0))
-        ]
-        
-        g = build_graph(
-            sch,
-            root_time=0.0,
-            root_feat=C.feature_centroid[0],
-            planted=planted,
+    for i, noise_std in enumerate(noise_std_sweep):
+        # Add a batch of instances at this noise level to the SAME graph
+        graph.add_evidence(
+            concept,
+            rng=np.random.default_rng(100 + i),
+            instances=instances_per_noise_level,
+            relation_pick="mode",
+            time_noise_std=float(noise_std),
+            feat_noise_std=0.0,
         )
-        
-        # Score noise-free concept against accumulated noisy graph
-        E = score(g, C)
-        
-        # Record result
-        rows.append(dict(kind="accumulated_noise", noise_std=float(noise), evidence=E, gamma=C.gamma, tau=C.tau))
+        total_instances += instances_per_noise_level
 
-    # Write results to CSV
-    # Columns: kind, noise_std, evidence, gamma, tau
-    out = write_csv("path_noise_accumulation_sweep.csv", rows)
+        # Use the implementation’s own scoring (test contains only test logic)
+        evidence = graph.evidence_score(concept)
 
-    # Print summary
+        rows.append(
+            dict(
+                kind="accumulated_noise_single_graph",
+                noise_std=float(noise_std),
+                instances_added=int(instances_per_noise_level),
+                total_instances=int(total_instances),
+                evidence=float(evidence),
+                gamma=float(concept.gamma),
+                tau=float(concept.tau),
+            )
+        )
+
+    out = write_csv("path_noise_accumulation_irrelevant_concept_sweep.csv", rows)
+    print(f"\n[path noise accumulation - irrelevant concept] wrote {out}")
+    print("noise_std -> evidence:", [(float(r["noise_std"]), float(r["evidence"])) for r in rows])
+
+
+def test_sensitivity_path_noise_accumulation_second_concept():
+    """
+    Continue adding increasingly noisy irrelevant_concept paths and inspect change in evidence score
+    
+    hypothesis: the evidence score will initially dampen, then quickly level out due to overly noisy paths
+    
+    FAILS THIS TEST
+    """
+    schema = make_schema()
+    base_concept = base_concept_r1r2(gamma=5.0, tau=1.0)
+
+    # One shared graph for the whole sweep (keeps scores directly comparable).
+    graph = Subgraph(schema=schema)
+    graph.create_root(time=0.0, feat=base_concept.feature_centroid[0])
+
+    # Start with a small clean baseline so the curve has an anchor point.
+    baseline_instances = 1
+    graph.add_evidence(
+        base_concept,
+        rng=np.random.default_rng(0),
+        instances=baseline_instances,
+        relation_pick="mode",
+        time_noise_std=0.0,
+        feat_noise_std=0.0,
+    )
+    
+    irrelevant_concept = base_concept_rxry(gamma=5.0, tau=1.0)
+
+    noise_levels = np.linspace(0.0, 1.0, 9)
+    instances_per_noise_level = 10  # multiple path instances per noise level
+
+    rows: List[Dict[str, Any]] = []
+    total_instances = baseline_instances
+
+    for i, noise_std in enumerate(noise_levels):
+        # Accumulate more evidence into the SAME graph at this noise level.
+        graph.add_evidence(
+            irrelevant_concept,
+            rng=np.random.default_rng(1 + i),
+            instances=instances_per_noise_level,
+            relation_pick="mode",
+            time_noise_std=float(noise_std),
+            feat_noise_std=0.0,
+        )
+        total_instances += instances_per_noise_level
+
+        # Use the implementation's evidence score directly (no custom scoring in tests).
+        E = graph.evidence_score(base_concept)
+
+        rows.append(
+            dict(
+                kind="accumulated_noise_single_graph",
+                noise_std=float(noise_std),
+                instances_added=int(instances_per_noise_level),
+                total_instances=int(total_instances),
+                evidence=float(E),
+                gamma=float(base_concept.gamma),
+                tau=float(base_concept.tau),
+            )
+        )
+
+    out = write_csv("path_noise_accumulation_sweep_second.csv", rows)
     print(f"\n[path noise accumulation] wrote {out}")
     print("noise_std -> evidence:", [(float(r["noise_std"]), float(r["evidence"])) for r in rows])
-    
-    
+
 # ============================================================
 # SECTION 3: Sensitivity tests - Feature component
 # ============================================================
@@ -267,13 +336,6 @@ def test_sensitivity_relation_similarity_sweep_writes_curve():
     Sweep relation probability mass and measure evidence response.
     
     Hypothesis: As probability mass on observed relations increases, evidence increases.
-    
-    Method:
-        1. Fix observed path (r1->r2) with perfect time/features
-        2. Vary concept's relation probability mass on r1 and r2
-        3. Score concept against graph
-        4. Record evidence at each probability level
-        5. Verify non-decreasing monotonicity
     """
     sch = make_schema()
 
@@ -326,6 +388,99 @@ def test_sensitivity_relation_similarity_sweep_writes_curve():
     print(f"\n[relation similarity] wrote {out}")
     print("p -> evidence:", [(float(r["p"]), float(r["evidence"])) for r in rows])
 
+# ============================================================
+# SECTION 5: Sensitivity tests - Time + Feature component
+# ============================================================
+# Tests that probe how evidence responds to relation probability changes.
+# ============================================================
+
+def test_sensitivity_stepwise_noise_independent_time_and_feature():
+    """
+    Add noise independently per relation-step (time + feature), then compare evidence.
+
+    Requirement: noise is independent per relation along the path (stepwise stds).
+    Hypothesis: No-noise > single-step noise > both-steps noise (in expectation).
+    """
+    schema = make_schema()
+    concept = base_concept_r1r2(gamma=5.0, tau=1.0)
+
+    # NOTE:
+    # This test assumes add_evidence supports per-step noise vectors:
+    #   time_noise_std=[...], feat_noise_std=[...]
+    # If your implementation currently only supports scalars, extend it so that
+    # it broadcasts scalars but accepts sequences of length == concept length.
+
+    instances = 40
+    replicates = 5
+
+    # Each entry is (label, time_noise_by_step, feat_noise_by_step)
+    profiles = [
+        ("clean",            [0.0, 0.0], [0.0, 0.0]),
+        ("time_step0",       [0.6, 0.0], [0.0, 0.0]),
+        ("time_step1",       [0.0, 0.6], [0.0, 0.0]),
+        ("time_both",        [0.6, 0.6], [0.0, 0.0]),
+        ("feat_step0",       [0.0, 0.0], [0.6, 0.0]),
+        ("feat_step1",       [0.0, 0.0], [0.0, 0.6]),
+        ("feat_both",        [0.0, 0.0], [0.6, 0.6]),
+        ("time_and_feat",    [0.6, 0.6], [0.6, 0.6]),
+    ]
+
+    rows: List[Dict[str, Any]] = []
+    avg_evidence: Dict[str, float] = {}
+
+    for label, time_std_steps, feat_std_steps in profiles:
+        evidences: List[float] = []
+
+        for r in range(replicates):
+            # Fresh graph per replicate to keep comparisons fair.
+            g = Subgraph(schema=schema)
+            g.create_root(time=0.0, feat=concept.feature_centroid[0])
+
+            g.add_evidence(
+                concept,
+                rng=np.random.default_rng(10_000 + 100 * r),
+                instances=instances,
+                relation_pick="mode",
+                time_noise_std=list(map(float, time_std_steps)),
+                feat_noise_std=list(map(float, feat_std_steps)),
+            )
+
+            E = float(g.evidence_score(concept))
+            assert 0.0 <= E <= 1.0
+            evidences.append(E)
+
+        avg = float(np.mean(evidences))
+        avg_evidence[label] = avg
+
+        rows.append(
+            dict(
+                kind="stepwise_noise_profile",
+                profile=label,
+                time_noise_step0=float(time_std_steps[0]),
+                time_noise_step1=float(time_std_steps[1]),
+                feat_noise_step0=float(feat_std_steps[0]),
+                feat_noise_step1=float(feat_std_steps[1]),
+                instances=int(instances),
+                replicates=int(replicates),
+                evidence_mean=avg,
+                evidence_std=float(np.std(evidences)),
+                gamma=float(concept.gamma),
+                tau=float(concept.tau),
+            )
+        )
+
+    # Basic ordering checks (soft, but meaningful).
+    assert avg_evidence["clean"] >= avg_evidence["time_step0"]
+    assert avg_evidence["clean"] >= avg_evidence["time_step1"]
+    assert avg_evidence["clean"] >= avg_evidence["feat_step0"]
+    assert avg_evidence["clean"] >= avg_evidence["feat_step1"]
+    assert avg_evidence["time_both"] <= max(avg_evidence["time_step0"], avg_evidence["time_step1"])
+    assert avg_evidence["feat_both"] <= max(avg_evidence["feat_step0"], avg_evidence["feat_step1"])
+    assert avg_evidence["time_and_feat"] <= min(avg_evidence["time_both"], avg_evidence["feat_both"])
+
+    out = write_csv("stepwise_noise_profiles.csv", rows)
+    print(f"\n[stepwise noise profiles] wrote {out}")
+    print("profile -> evidence_mean:", [(r["profile"], float(r["evidence_mean"])) for r in rows])
 
 # ============================================================
 # SECTION 5: Sensitivity tests - Noise component
@@ -389,6 +544,83 @@ def test_sensitivity_noise_sweep_time_and_feature_writes_curve(gamma: float):
     print("noise -> evidence:", [(float(r["noise_std"]), float(r["evidence"])) for r in rows])
 
 
+# ============================================================
+# SECTION 5: concept sizes
+# ============================================================
+# Tests that probe how evidence responds to generation noise with varying gamma.
+# ============================================================
+
+
+def test_sensitivity_concept_sizes_and_coverage_cases():
+    """
+    Check concept evidence under size/coverage mismatches.
+
+    Required cases:
+      1) Concept longer than any present in graph
+      2) Concept includes relations not in graph
+      3) Concept where only part exists in graph (graph has r1->r2, concept is only r1)
+    """
+    schema = make_schema()
+    full = base_concept_r1r2(gamma=5.0, tau=1.0)
+    irrelevant = base_concept_rxry(gamma=5.0, tau=1.0)
+
+    # Build "r1-only" concept by slicing the first step from the full concept.
+    # (Assumes concept_template matches the helpers used elsewhere in the suite.)
+    r1_only = concept_template(
+        name="C_r1_only",
+        rel_probs=full.rel_probs[:1],
+        time_deltas=[full.time_deltas[0]],
+        feature_centroid=[full.feature_centroid[0]],
+        gamma=full.gamma,
+        tau=full.tau,
+    )
+
+    # ------------------------------------------------------------
+    # Case A: Graph contains full concept evidence (r1->r2).
+    # ------------------------------------------------------------
+    g_full = build_graph(
+        schema,
+        root_time=0.0,
+        root_feat=full.feature_centroid[0],
+        planted=[(full, dict(rng=np.random.default_rng(0), instances=25, rel_pick="mode"))],
+    )
+
+    E_full = float(g_full.evidence_score(full))
+    E_partial = float(g_full.evidence_score(r1_only))      # only part of the structure required
+    E_irrelevant = float(g_full.evidence_score(irrelevant)) # relations not in the graph
+
+    assert 0.0 <= E_full <= 1.0
+    assert 0.0 <= E_partial <= 1.0
+    assert 0.0 <= E_irrelevant <= 1.0
+
+    # Required: relation-not-in-graph should score worst.
+    assert E_full > E_irrelevant
+    assert E_partial > E_irrelevant
+
+    # ------------------------------------------------------------
+    # Case B: Graph contains only r1-only evidence; score longer concept (r1->r2).
+    # ------------------------------------------------------------
+    g_r1 = build_graph(
+        schema,
+        root_time=0.0,
+        root_feat=r1_only.feature_centroid[0],
+        planted=[(r1_only, dict(rng=np.random.default_rng(1), instances=25, rel_pick="mode"))],
+    )
+
+    E_r1_on_r1 = float(g_r1.evidence_score(r1_only))
+    E_full_on_r1 = float(g_r1.evidence_score(full))  # concept longer than any present in graph
+
+    assert 0.0 <= E_r1_on_r1 <= 1.0
+    assert 0.0 <= E_full_on_r1 <= 1.0
+
+    # Required: longer-than-graph should be penalized relative to the matching shorter concept.
+    assert E_r1_on_r1 > E_full_on_r1
+
+    print("\n[concept coverage cases]")
+    print(f"full graph:     E_full={E_full:.4f}, E_partial={E_partial:.4f}, E_irrelevant={E_irrelevant:.4f}")
+    print(f"r1-only graph:  E_r1_on_r1={E_r1_on_r1:.4f}, E_full_on_r1={E_full_on_r1:.4f}")
+    
+    
 # ============================================================
 # SECTION 6: Sensitivity tests - Multiple concepts (mixtures)
 # ============================================================

@@ -20,7 +20,7 @@ class Subgraph:
         """Create a new node"""
         next_id = self._next_id
         self._next_id += 1
-        self.nodes[next_id] = Node(id=next_id, node_type=node_type, time=float(time), feat=np.asarray(feat, dtype=float))
+        self.nodes[next_id] = Node(id=next_id, node_type=node_type, time=float(time), feature_embedding=np.asarray(feat, dtype=float))
         return next_id
 
     def _add_edge(self, source: NodeId, destination: NodeId, relation: str):
@@ -30,7 +30,7 @@ class Subgraph:
 
     def create_root(self, time: float, feat: np.ndarray) -> NodeId:
         """Create root node for subgraph"""
-        rid = self._new_node(self.schema.root_type, time, feat)
+        rid = self._new_node(self.schema.root_type, time=time, feat=feat)
         self.root = rid
         return rid
 

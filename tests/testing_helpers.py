@@ -97,10 +97,10 @@ def concept_template(
     """
     return Concept(
         name=name,
-        rel_types=REL_TYPES,
-        rel_probs=np.asarray(rel_probs, dtype=float),
+        relation_types=REL_TYPES,
+        relation_probs=np.asarray(rel_probs, dtype=float),
         time_deltas=list(map(float, time_deltas)),
-        feat_mu=[np.asarray(x, dtype=float) for x in feat_mu],
+        feature_centroid=[np.asarray(x, dtype=float) for x in feat_mu],
         gamma=float(gamma),
         tau=float(tau),
     )
