@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Sequence
 import numpy as np
 
 NodeId = int
@@ -48,6 +48,9 @@ class Concept:
     gamma: float = 1.0
     tau: float = 0.0
 
+    gamma_time: Optional[Sequence[float]] = None
+    gamma_feat: Optional[Sequence[float]] = None
+
     def __post_init__(self) -> None:
         rp = np.asarray(self.relation_probs, dtype=float)
         if rp.ndim != 2:
@@ -73,6 +76,25 @@ class Concept:
 
     def relation_index(self) -> Dict[str, int]:
         return {r: i for i, r in enumerate(self.relation_types)}
+    
+    def _as_gamma_vec(self, maybe_vec: Optional[Sequence[float]], L: int, default: float) -> np.ndarray:
+        if maybe_vec is None:
+            return np.full(L, float(default), dtype=float)
+        arr = np.asarray(maybe_vec, dtype=float).reshape(-1)
+        if arr.size == 1:
+            return np.full(L, float(arr.item()), dtype=float)
+        if arr.size != L:
+            raise ValueError(f"Expected gamma vector of length {L}, got {arr.size}.")
+        return arr
+
+    def gamma_time_vec(self) -> np.ndarray:
+        return self._as_gamma_vec(self.gamma_time, self.L(), self.gamma)
+
+    def gamma_feat_vec(self) -> np.ndarray:
+        return self._as_gamma_vec(self.gamma_feat, self.L(), self.gamma)
+
+    def gamma_root_scalar(self) -> float:
+        return float(self.gamma if self.gamma_root is None else self.gamma_root)
 
 
 @dataclass(frozen=True)

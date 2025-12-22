@@ -186,20 +186,78 @@ class Subgraph:
         return relational_similarity
 
     @staticmethod
-    def _time_and_feature_similarity(root_features: np.ndarray, path_times: np.ndarray, path_feature_centroids: np.ndarray, hypothesis_concept: Concept) -> float:
-        
-        # Extract the features from the hypothesized concept
-        concept_times = np.array(hypothesis_concept.time_deltas, dtype=float)
-        concept_root_features = np.array(hypothesis_concept.feature_centroid[0])
-        concept_features = np.stack(hypothesis_concept.feature_centroid[1:], axis=0)
+    def _time_and_feature_similarity(
+        root_features: np.ndarray,
+        path_times: np.ndarray,
+        path_feature_centroids: np.ndarray,
+        hypothesis_concept: Concept,
+    ) -> float:
+        """
+        Uses the Option-1 reparameterisation:
+            S(d) = exp(-gamma d^2),  gamma = -ln(k) / rho^2  so that S(rho)=k.
+        Supports per-hop rho vectors (time/features). Falls back to existing gamma if rho not provided.
+        """
 
-        # Determine raw distance of paths from hypothesized concepts
-        root_difference = root_features - concept_root_features
-        time_difference = path_times - concept_times
-        feature_difference = path_feature_centroids - concept_features
+        # ---- hyperparameter for interpretability: similarity threshold ----
+        # Prefer concept-provided threshold; otherwise default to "half-similarity radius".
+        k = float(getattr(hypothesis_concept, "rbf_k", 0.5))
+        if not (0.0 < k < 1.0):
+            raise ValueError(f"rbf_k must be in (0,1), got {k}.")
+        neg_log_k = -float(np.log(k))
+        eps = 1e-12
 
-        squared_norm = float(np.sum(root_difference * root_difference) + np.sum(time_difference * time_difference) + np.sum(feature_difference * feature_difference))
-        return float(np.exp(-hypothesis_concept.gamma * squared_norm))
+        # ---- Concept prototypes ----
+        concept_times = np.array(hypothesis_concept.time_deltas, dtype=float)                  # (L,)
+        concept_root_features = np.array(hypothesis_concept.feature_centroid[0], dtype=float)  # (D,)
+        concept_features = np.stack(hypothesis_concept.feature_centroid[1:], axis=0).astype(float)  # (L,D)
+
+        # ---- Differences ----
+        root_diff = root_features - concept_root_features                      # (D,)
+        time_diff = path_times - concept_times                                 # (L,)
+        feat_diff = path_feature_centroids - concept_features                  # (L,D)
+        feat_sq = np.sum(feat_diff * feat_diff, axis=1)                        # (L,)
+
+        L = int(time_diff.shape[0])
+
+        # ---- Retrieve rho (preferred) or gamma (legacy), and convert to gamma ----
+        def _gamma_from_rho_or_gamma(rho_attr: str, gamma_vec: np.ndarray) -> np.ndarray:
+            """
+            If concept has a callable <rho_attr>() returning length-L radii, use:
+                gamma = -ln(k) / rho^2
+            Else use provided legacy gamma vector.
+            """
+            rho_fn = getattr(hypothesis_concept, rho_attr, None)
+            if callable(rho_fn):
+                rho = np.asarray(rho_fn(), dtype=float).reshape(-1)
+                if rho.size == 1:
+                    rho = np.full(L, float(rho.item()), dtype=float)
+                if rho.size != L:
+                    raise ValueError(f"{rho_attr} must be length {L}, got {rho.size}.")
+                return neg_log_k / np.maximum(rho * rho, eps)
+            return gamma_vec
+
+        # Legacy per-hop gamma vectors (still supported)
+        gamma_t_legacy = np.asarray(hypothesis_concept.gamma_time_vec(), dtype=float)  # (L,)
+        gamma_x_legacy = np.asarray(hypothesis_concept.gamma_feat_vec(), dtype=float)  # (L,)
+
+        # New: per-hop radii -> gamma
+        gamma_t = _gamma_from_rho_or_gamma("rho_time_vec", gamma_t_legacy)
+        gamma_x = _gamma_from_rho_or_gamma("rho_feat_vec", gamma_x_legacy)
+
+        # Root: either rho_root (preferred) or legacy gamma_root
+        rho_root_fn = getattr(hypothesis_concept, "rho_root_scalar", None)
+        if callable(rho_root_fn):
+            rho_root = float(rho_root_fn())
+            gamma_root = neg_log_k / max(rho_root * rho_root, eps)
+        else:
+            gamma_root = float(hypothesis_concept.gamma_root_scalar())
+
+        # ---- Weighted exponent ----
+        root_term = gamma_root * float(np.sum(root_diff * root_diff))
+        time_term = float(np.sum(gamma_t * (time_diff * time_diff)))
+        feat_term = float(np.sum(gamma_x * feat_sq))
+
+        return float(np.exp(-(root_term + time_term + feat_term)))
 
     def evidence_score(self, hypothesis_concept: Concept, L: Optional[int] = None) -> float:
 
