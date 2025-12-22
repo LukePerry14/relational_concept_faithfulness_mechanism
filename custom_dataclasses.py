@@ -5,8 +5,6 @@ import numpy as np
 NodeId = int
 
 NULL_TOKEN = "∅"
-MISSING_TIME = 1e6
-MISSING_FEAT = 1e6
 EPS = 1e-12
 DEFAULT_TAU = 0.5
 
@@ -77,7 +75,7 @@ class MetaPath:
             f"  path_name={self.path_name!r},\n"
             f"  node_types={self.node_types},\n"
             f"  node_times={self.node_times},\n"
-            f"  node_features={self.node_features.shape}\n"
+            f"  node_features={self.node_features}\n"
             f")"
         )
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 from typing import Dict, List, Literal, Tuple, Optional
 import numpy as np
+import networkx as nx
+import plotly.graph_objects as go
 from collections import deque
-
 from custom_dataclasses import *
 NodeId = int
 
 DEFAULT_TAU = 0.5
+MISSING_TIME = float('inf')
+MISSING_FEAT = float('inf')
+
 
 class Subgraph:
     """
@@ -20,6 +24,125 @@ class Subgraph:
         self.adj: Dict[NodeId, List[Tuple[str, NodeId]]] = {}
         self._next_id: int = 0
         self.root: Optional[NodeId] = None
+        self.MISSING_TIME = MISSING_TIME
+
+    # --- visualise ----
+
+    def visualize_subgraph_plotly(self,):
+        """
+        Interactive Plotly visualisation of a Subgraph.
+
+        - Node colours represent node types.
+        - Hover text shows:
+            * node id
+            * node type
+            * time
+            * feature vector
+
+        Requires:
+            pip install plotly networkx
+        """
+        title = "Subgraph"
+
+        if self.root is None:
+            raise ValueError("Subgraph has no root; call create_root(...) first.")
+
+        # Build NX graph
+        G = nx.DiGraph()
+        for nid, node in self.nodes.items():
+            G.add_node(
+                nid,
+                node_type=node.node_type,
+                time=node.time,
+                feature=node.feature,
+            )
+        for edge in self.edges:
+            G.add_edge(edge.src, edge.dst, relation=edge.relation)
+
+        # Layout
+        pos = nx.spring_layout(G, seed=42)  # consistent layout
+
+        # Edge coordinates
+        edge_x, edge_y = [], []
+        for src, dst in G.edges():
+            x0, y0 = pos[src]
+            x1, y1 = pos[dst]
+            edge_x += [x0, x1, None]
+            edge_y += [y0, y1, None]
+
+        edge_trace = go.Scatter(
+            x=edge_x,
+            y=edge_y,
+            mode="lines",
+            line=dict(width=1),
+            hoverinfo="none"
+        )
+
+        # Build node hover labels + colors
+        node_x, node_y, hovertext, labels, types = [], [], [], [], []
+
+        for nid, data in G.nodes(data=True):
+            x, y = pos[nid]
+            node_x.append(x)
+            node_y.append(y)
+            labels.append(str(data["node_type"]))
+            types.append(data["node_type"])
+
+            feat_str = np.array2string(
+                np.asarray(data["feature"], dtype=float),
+                precision=3,
+                separator=", ",
+                suppress_small=True,
+            )
+
+            hovertext.append(
+                f"<b>id:</b> {nid}<br>"
+                f"<b>type:</b> {data['node_type']}<br>"
+                f"<b>time:</b> {data['time']:.3f}<br>"
+                f"<b>feature:</b> {feat_str}"
+            )
+
+        # Assign colours for node types
+        unique = sorted(set(types))
+        palette = [
+            "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728",
+            "#9467bd", "#8c564b", "#e377c2", "#7f7f7f",
+            "#bcbd22", "#17becf"
+        ]
+        color_map = {t: palette[i % len(palette)] for i, t in enumerate(unique)}
+        node_colors = [color_map[t] for t in types]
+
+        node_trace = go.Scatter(
+            x=node_x,
+            y=node_y,
+            text=labels,
+            mode="markers+text",
+            textposition="top center",
+            hovertext=hovertext,
+            hoverinfo="text",
+            marker=dict(
+                size=16,
+                color=node_colors,
+                line=dict(width=1, color="#333333"),
+            ),
+        )
+
+        fig = go.Figure(
+            data=[edge_trace, node_trace],
+            layout=go.Layout(
+                title=title,
+                title_x=0.5,
+                showlegend=False,
+                hovermode="closest",
+                margin=dict(b=20, l=5, r=5, t=40),
+                xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+                yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            )
+        )
+
+        fig.show()
+        return fig
+
 
     # ---- graph construction ----
 
@@ -44,6 +167,8 @@ class Subgraph:
         """
         root_id = self._new_node(self.schema.root_type, time=time, feat=feat)
         self.root = root_id
+        self.D = feat.shape[0]
+        self.MISSING_FEAT = np.asarray([float('inf')] * self.D)
         return root_id
 
     def add_evidence(self, metapaths):
@@ -85,110 +210,137 @@ class Subgraph:
     
     # ---- path sampling ----
 
-    def sample_paths(self, max_hop, n_samples=128, rng=None):
+    def sample_paths(self, max_hops, n_samples=128, rng=None):
         """
         We want to sample meta-paths from the immediate surroundings. The number of possible meta-paths allowing for truncations is combinatorial,
         instead, we sample up to the maximum and allow gamma to ignore irrelevant structural nodes
+
+        Current strategy is enumerate all neighbours then sample, might need to change to stochastic DFS if too many paths
         """
-        if self.root == None:
-            raise Exception("Create the root first")
-        
-        root_node = self.nodes[self.root]
-        
-        frontier = deque()
-        frontier.append(self.root)
-        
-        back_dict = {}
-        
-        samples = 0
-        
-        
-        while samples < n_samples:
+        if self.root is None:
+            raise ValueError("Root not set. Call create_root(...) first.")
+
+        rng = rng or np.random.default_rng()
+
+        root_id = self.root
+        root_node = self.nodes[root_id]
+        root_time = float(root_node.time)
+        root_feat = root_node.feature
+        D = self.D
+
+        # ---- Step 1: enumerate all simple maximal paths up to max_hops ----
+        all_paths: List[List[int]] = []
+        seen_paths: set[tuple[int, ...]] = set()
+
+        def dfs(path: List[int]) -> None:
+            """
+            path is a list of node IDs [root, ..., v_k].
+            depth = number of hops from root = len(path) - 1.
+            """
+            depth = len(path) - 1
+            current = path[-1]
+            out_edges = self.adj.get(current, [])
+
+            # Decide if this path is "maximal" (cannot/should not be extended)
+            is_max_length = depth >= max_hops
+            is_dead_end = len(out_edges) == 0
+
+            if depth >= 1 and (is_max_length or is_dead_end):
+                key = tuple(path)
+                if key not in seen_paths:
+                    seen_paths.add(key)
+                    all_paths.append(path.copy())
+
+            # If we've hit max_hops, do not extend further
+            if is_max_length:
+                return
+
+            # Otherwise, we can still extend (only from non-dead-ends)
+            for _rel, dst in out_edges:
+                # avoid cycles: simple paths only
+                if dst in path:
+                    continue
+                path.append(dst)
+                dfs(path)
+                path.pop()
+
+        dfs([root_id])
+
+        if not all_paths:
+            return []
+
+        # ---- Step 2: subsample without replacement if needed ----
+        num_paths = len(all_paths)
+        if num_paths > n_samples:
+            idx = rng.choice(num_paths, size=n_samples, replace=False)
+            chosen_paths = [all_paths[i] for i in idx]
+        else:
+            rng.shuffle(all_paths)
+            chosen_paths = all_paths
+
+        # ---- Step 3: convert to MetaPath with consistent lengths ----
+        samples: List[MetaPath] = []
+
+        for path in chosen_paths:
+            # path = [root, v1, ..., v_k], with 1 <= k <= max_hops
+            node_ids = path[1:]
+            hop_count = len(node_ids)
+
+            # node_types: length max_hops, pad with NULL_TOKEN
+            node_types: List[str] = []
+            for h in range(max_hops):
+                if h < hop_count:
+                    node_types.append(self.nodes[node_ids[h]].node_type)
+                else:
+                    node_types.append(NULL_TOKEN)
+
+            # node_times: [root_time, offsets...] padded to max_hops+1
+            offsets: List[float] = []
+            for nid in node_ids:
+                v_node = self.nodes[nid]
+                # Keep absolute times (distance from present day), not offsets
+                offsets.append(float(v_node.time))
+
+            t_sig = np.full((max_hops + 1,), self.MISSING_TIME, dtype=float)
+            t_sig[0] = root_time
+            if offsets:
+                t_sig[1 : 1 + len(offsets)] = np.asarray(offsets, dtype=float)
+
+            # node_features: [root_feat, feats...] padded to max_hops+1
+            feats: List[np.ndarray] = []
+            for nid in node_ids:
+                feats.append(self.nodes[nid].feature)
+
+            mu_sig = np.full((max_hops + 1, D), self.MISSING_FEAT, dtype=float)
+            mu_sig[0] = root_feat
+            if feats:
+                mu_sig[1 : 1 + len(feats)] = np.stack(feats, axis=0).astype(float)
+
+            samples.append(
+                MetaPath(
+                    path_name=None,
+                    node_types=node_types,
+                    node_times=t_sig,
+                    node_features=mu_sig,
+                )
+            )
+
+        return samples
             
             
-    #     # rng is unused now; kept only for API compatibility.
-
-    #     root_id = self.root
-    #     root_node = self.nodes[root_id]
-    #     root_time = float(root_node.time)
-    #     root_feat = root_node.feature
-    #     D = int(root_feat.shape[0])
-
-    #     # Each element in the frontier is a list of node IDs [root, v1, ..., vk]
-    #     from collections import deque
-    #     frontier = deque()
-    #     frontier.append([root_id])
-
-    #     path_node_lists: List[List[int]] = []
-
-    #     # BFS over paths (not over nodes) to build distinct simple paths
-    #     while frontier and len(path_node_lists) < int(n_samples):
-    #         path = frontier.popleft()
-    #         depth = len(path) - 1  # number of hops from root
-
-    #         # Record this path if it has at least one hop
-    #         if depth >= 1:
-    #             path_node_lists.append(path)
-
-    #         # If we've already hit the maximum length, do not expand further
-    #         if depth >= int(L):
-    #             continue
-
-    #         current = path[-1]
-    #         out_edges = self.adj.get(current, [])
-    #         for _rel, dst in out_edges:
-    #             # Avoid cycles: do not revisit nodes already in this path
-    #             if dst in path:
-    #                 continue
-    #             new_path = path + [dst]
-    #             frontier.append(new_path)
-
-    #     samples: List[MetaPath] = []
-
-    #     for path in path_node_lists:
-    #         # path = [root, v1, v2, ..., vk]
-    #         node_ids = path[1:]  # exclude root for meta-path node-type sequence
-    #         types: List[str] = []
-    #         offsets: List[float] = []
-    #         feats: List[np.ndarray] = []
-
-    #         for nid in node_ids:
-    #             v_node = self.nodes[nid]
-    #             types.append(v_node.node_type)
-    #             offsets.append(float(v_node.time - root_time))  # offset from seed
-    #             feats.append(v_node.feature)
-
-    #         # Time signature: absolute root time + offsets, padded to length L+1
-    #         t_sig = np.full((L + 1,), MISSING_TIME, dtype=float)
-    #         t_sig[0] = root_time
-    #         if offsets:
-    #             t_sig[1 : 1 + len(offsets)] = np.asarray(offsets, dtype=float)
-
-    #         # Feature signature: root feature + per-hop features, padded to length L+1
-    #         mu_sig = np.full((L + 1, D), MISSING_FEAT, dtype=float)
-    #         mu_sig[0] = root_feat
-    #         if feats:
-    #             mu_sig[1 : 1 + len(feats)] = np.stack(feats, axis=0).astype(float)
-
-    #         samples.append(MetaPath(path_name=None, node_types=types, node_times=t_sig, node_features=mu_sig))
-
-    #     return samples
-
-
-    # ---- similarity primitives ----
+   
 
     @staticmethod
     def _relational_similarity(P: np.ndarray, M: np.ndarray, X: np.ndarray) -> float:
         """
         S_rel = 1 - (1 / ||X||₁) * Σ_{i,j} X_{i,j} (P_{i,j} - M_{i,j})²
         """
-        denom = float(np.sum(X))
+        denom = float(np.sum(M))
         if denom <= 0.0:
             return 0.0
 
-        err = (P - M) ** 2
-        masked = err * X
-        s = 1.0 - float(np.sum(masked) / denom)
+        masked = (M * P)**2
+        s = float(np.sum(masked) / denom)
         return float(np.clip(s, 0.0, 1.0))
 
     @staticmethod
@@ -215,8 +367,10 @@ class Subgraph:
         if not (0.0 < k < 1.0):
             raise ValueError(f"k must be in (0,1), got {k}")
 
-        # Mask: finite radius and non-missing sample
-        mask = np.isfinite(gamma_t) & (np.abs(sample_t - MISSING_TIME) > 1.0)
+        # Mask: finite radius and non-missing (finite) sample times.
+        # Avoid subtracting infinities (which produces NaN warnings) by
+        # testing for finite sample_t first.
+        mask = np.isfinite(gamma_t) & np.isfinite(sample_t)
         if not np.any(mask):
             return 1.0
 
@@ -263,7 +417,9 @@ class Subgraph:
             if not np.isfinite(g_i):
                 continue  # ignored hop
 
-            if np.all(np.abs(sample_mu[i] - MISSING_FEAT) <= 1.0):
+            # If the sample features at this hop are all missing (non-finite),
+            # skip this hop. Avoid subtracting infinities to prevent warnings.
+            if not np.any(np.isfinite(sample_mu[i])):
                 continue  # missing sample at this hop
 
             diff = proto_mu[i] - sample_mu[i]
@@ -310,29 +466,33 @@ class Subgraph:
 
         L = concept.L()
         K = len(concept.ordered_node_types) + 1  # + NULL_TOKEN column
+        D = self.D
 
         # Shape checks
         if concept.P.shape != (L, K):
             raise ValueError(f"P must be shape {(L, K)}, got {concept.P.shape}")
         if concept.t.shape != (L + 1,) or concept.gamma_t.shape != (L + 1,):
             raise ValueError("t and gamma_t must be shape (L+1,)")
-        if concept.mu.shape[0] != (L + 1,):
+        if concept.mu.shape != (L + 1, D):
             raise ValueError("mu must have shape (L+1, D)")
-        if concept.gamma_mu.shape != (L + 1,):
-            raise ValueError("gamma_mu must be shape (L+1,)")
+        if concept.gamma_mu.shape != (L + 1, ):
+            raise ValueError("gamma_mu must be shape (L+1, 1)")
+
 
         type_idx = concept.type_index()
         X = self.schema.reachability_mask(L, concept.ordered_node_types)
-        paths = self.sample_paths(L=L, n_samples=n_samples, rng=rng)
+        paths = self.sample_paths(max_hops=L, n_samples=n_samples, rng=rng)
 
         mass = 0.0
         for p in paths:
+            if p.node_types[0] == "subscriptions":
+                print("here")
             # Build M: L × K one-hot over node types + NULL_TOKEN
             M = np.zeros((L, K), dtype=float)
             valid = True
             for hop in range(L):
-                if hop < len(p.node_type_sequence):
-                    t = p.node_type_sequence[hop]
+                if hop < len(p.node_types):
+                    t = p.node_types[hop]
                 else:
                     t = NULL_TOKEN
                 j = type_idx.get(t)
@@ -350,7 +510,7 @@ class Subgraph:
 
             s_time = self._time_similarity(
                 proto_t=concept.t,
-                sample_t=p.time_signature,
+                sample_t=p.node_times,
                 gamma_t=concept.gamma_t,
                 k=concept.k_time,
             )
@@ -359,13 +519,14 @@ class Subgraph:
 
             s_feat = self._feature_similarity(
                 proto_mu=concept.mu,
-                sample_mu=p.feature_signature,
+                sample_mu=p.node_features,
                 gamma_mu=concept.gamma_mu,
                 k=concept.k_feat,
             )
             if s_feat <= 0.0:
                 continue
-
+            
+            print(f"Path: {p.node_types}, S_rel={s_rel:.4f}, S_time={s_time:.4f}, S_feat={s_feat:.4f}, total={s_rel * s_time * s_feat:.4f}")
             mass += float(s_rel * s_time * s_feat)
 
         tau = concept.tau if concept.tau is not None else DEFAULT_TAU
