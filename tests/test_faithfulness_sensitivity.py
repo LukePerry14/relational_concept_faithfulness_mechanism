@@ -4,6 +4,12 @@
 # This module contains characterization-oriented tests for the evidence-score
 # sensitivity metric described in Strategy_discussion.pdf (Eq. 8–13).
 #
+# NOTE (updated for node-type prototypes + new Concept API):
+#   - Relational prototypes are now over node types via Concept.P
+#   - Time prototypes are in Concept.t (root absolute time + offsets)
+#   - Feature prototypes are in Concept.mu
+#   - Kernel windows are Concept.gamma_t and Concept.gamma_mu
+#
 # Purpose:
 #   - Probe the expressiveness/sensitivity of the evidence scoring function
 #   - Sweep controlled parameters (time, features, relations, noise)
@@ -11,18 +17,6 @@
 #   - Verify monotonicity properties (sanity checks only)
 #
 # Outputs: CSV files written to <this file's dir>/evidence_reports/
-#
-# Execution notes (order & side-effects):
-#   - PyTest collects the functions below in module order and executes any
-#   - test_* functions it finds. Several tests perform parameter sweeps and
-#     write CSV files into `REPORT_DIR` for offline inspection. The CSV outputs
-#     are side-effects of these tests; they are intentional and useful for
-#     sensitivity analysis. Running `pytest -q -s` will both execute the
-#     assertions and produce the CSV artifacts.
-#
-#   - Randomness: tests that rely on sampling set explicit RNG seeds to make
-#     behavior reproducible. Tests that perform large-sample sampling use
-#     deterministic seeds to produce stable counts for assertions.
 #
 # Run with: pytest -q -s
 # ============================================================
@@ -41,15 +35,13 @@ from testing_helpers import *
 # ============================================================
 # SECTION 1: Smoke tests (sanity checks only)
 # ============================================================
-# Basic validation tests to ensure setup is correct.
-# ============================================================
 
 def test_smoke_concept_normalizes_rel_probs_rows():
     """
-    Verify that concept relation probability rows sum to 1.0 (valid probability distribution).
+    Verify that concept relational prototype rows (over node types) sum to 1.0.
     """
     c = base_concept_r1r2()
-    rs = c.rel_probs.sum(axis=1)
+    rs = c.P.sum(axis=1)
     assert np.allclose(rs, 1.0)
 
 
@@ -59,18 +51,18 @@ def test_smoke_evidence_in_range():
     """
     sch = make_schema()
     c = base_concept_r1r2(gamma=3.0, tau=1.0)
-    
-    # Build graph with one perfect r1->r2 instance
+
+    # Build graph with one perfect instance of the concept
     g = build_graph(
         sch,
-        root_time=0.0,
-        root_feat=c.feature_centroid[0],
+        root_time=float(c.t[0]),
+        root_feat=c.mu[0],
         planted=[(c, dict(rng=np.random.default_rng(0), instances=1, rel_pick="mode"))],
     )
-    
+
     # Score the concept against itself
     E = score(g, c)
-    
+
     # Check range
     assert 0.0 <= E <= 1.0
 
@@ -78,70 +70,81 @@ def test_smoke_evidence_in_range():
 # ============================================================
 # SECTION 2: Sensitivity tests - Time component
 # ============================================================
-# Tests that probe how evidence responds to temporal mismatches.
-# ============================================================
 
 def test_sensitivity_time_similarity_sweep():
     """
-    Create 10 single path subgraphs, each with values further from ground truth and measure evidence score dropoff
-    
-    Hypothesis: As temporal mismatch increases, evidence should decrease
+    Create single-path subgraphs with time prototypes progressively further
+    from the ground truth and measure evidence score dropoff.
+
+    Hypothesis: As temporal mismatch increases, evidence should decrease.
     """
     sch = make_schema()
     C = base_concept_r1r2(gamma=5.0, tau=1.0)
 
-    # Sweep time offsets from 0 to 4 seconds
+    # Sweep time offsets applied to all non-root hops
     offsets = np.linspace(0.0, 4.0, 9)
     rows: List[Dict[str, Any]] = []
 
     for off in offsets:
-        # Create concept with shifted time deltas
-        C_gen = concept_template(
+        # Create concept with shifted time prototype (keep everything else fixed)
+        t_gen = C.t.copy()
+        t_gen[1:] = C.t[1:] + off
+
+        C_gen = Concept(
             name=f"C_gen_time_off_{off:.2f}",
-            rel_probs=C.rel_probs,  # Same relation preferences
-            time_deltas=[C.time_deltas[0] + off, C.time_deltas[1] + off],  # Shifted times
-            feature_centroid=C.feature_centroid,  # Same features
-            gamma=C.gamma,
+            ordered_node_types=C.ordered_node_types,
+            P=C.P.copy(),
+            t=t_gen,
+            gamma_t=C.gamma_t.copy(),
+            mu=C.mu.copy(),
+            gamma_mu=C.gamma_mu.copy(),
             tau=C.tau,
+            k_time=C.k_time,
+            k_feat=C.k_feat,
         )
-        
+
         # Build graph with shifted concept, score with original
         g = build_graph(
             sch,
-            root_time=0.0,
-            root_feat=C.feature_centroid[0],
+            root_time=float(C.t[0]),
+            root_feat=C.mu[0],
             planted=[(C_gen, dict(rng=np.random.default_rng(0), instances=1, rel_pick="mode"))],
         )
         E = score(g, C)
-        
-        # Record result
-        rows.append(dict(kind="time_offset", offset=float(off), evidence=E, gamma=C.gamma, tau=C.tau))
 
-    # Write results to CSV
-    # Columns: kind, offset, evidence, gamma, tau
+        rows.append(
+            dict(
+                kind="time_offset",
+                offset=float(off),
+                evidence=float(E),
+                gamma=float(C.gamma_t[1]),
+                tau=float(C.tau),
+            )
+        )
+
     out = write_csv("time_similarity_offset_sweep.csv", rows)
-    
+
     # Verify monotonicity property
     ev = np.array([r["evidence"] for r in rows], dtype=float)
     assert nonincreasing(ev, atol=1e-8)
 
-    # Print summary
     print(f"\n[time similarity] wrote {out}")
     print("offset -> evidence:", [(float(r["offset"]), float(r["evidence"])) for r in rows])
 
 
 def test_sensitivity_path_noise_accumulation_same_concept():
     """
-    Continue adding increasingly noisy base_concept paths and inspect change in evidence score
-    
-    hypothesis: the evidence score will initially dampen, then quickly level out due to overly noisy paths
+    Continue adding increasingly noisy base_concept paths and inspect change in evidence score.
+
+    Hypothesis: the evidence score will initially dampen, then quickly level out
+    due to overly noisy paths.
     """
     schema = make_schema()
     concept = base_concept_r1r2(gamma=5.0, tau=1.0)
 
     # One shared graph for the entire sweep (keeps scores comparable)
     graph = Subgraph(schema)
-    graph.create_root(time=0.0, feat=concept.feature_centroid[0])
+    graph.create_root(time=float(concept.t[0]), feat=concept.mu[0])
 
     # Start with a single clean instance as a baseline signal
     graph.add_evidence(
@@ -171,8 +174,7 @@ def test_sensitivity_path_noise_accumulation_same_concept():
         )
         total_instances += instances_per_noise_level
 
-        # Use the implementation’s own scoring (test contains only test logic)
-        evidence = graph.evidence_score(concept)
+        evidence = float(graph.evidence_score(concept))
 
         rows.append(
             dict(
@@ -180,8 +182,8 @@ def test_sensitivity_path_noise_accumulation_same_concept():
                 noise_std=float(noise_std),
                 instances_added=int(instances_per_noise_level),
                 total_instances=int(total_instances),
-                evidence=float(evidence),
-                gamma=float(concept.gamma),
+                evidence=evidence,
+                gamma=float(concept.gamma_t[1]),
                 tau=float(concept.tau),
             )
         )
@@ -193,20 +195,18 @@ def test_sensitivity_path_noise_accumulation_same_concept():
 
 def test_sensitivity_path_noise_accumulation_second_concept():
     """
-    Continue adding increasingly noisy irrelevant_concept paths and inspect change in evidence score
-    
-    hypothesis: the evidence score will initially dampen, then quickly level out due to overly noisy paths
-    
-    FAILS THIS TEST
+    Continue adding increasingly noisy irrelevant_concept paths and inspect change in evidence score.
+
+    Hypothesis: the evidence score will initially dampen, then quickly level out due to overly noisy paths.
     """
     schema = make_schema()
     base_concept = base_concept_r1r2(gamma=5.0, tau=1.0)
 
-    # One shared graph for the whole sweep (keeps scores directly comparable).
+    # One shared graph for the whole sweep (keeps scores directly comparable)
     graph = Subgraph(schema=schema)
-    graph.create_root(time=0.0, feat=base_concept.feature_centroid[0])
+    graph.create_root(time=float(base_concept.t[0]), feat=base_concept.mu[0])
 
-    # Start with a small clean baseline so the curve has an anchor point.
+    # Start with a small clean baseline so the curve has an anchor point
     baseline_instances = 1
     graph.add_evidence(
         base_concept,
@@ -216,17 +216,16 @@ def test_sensitivity_path_noise_accumulation_second_concept():
         time_noise_std=0.0,
         feat_noise_std=0.0,
     )
-    
+
     irrelevant_concept = base_concept_rxry(gamma=5.0, tau=1.0)
 
     noise_levels = np.linspace(0.0, 1.0, 9)
-    instances_per_noise_level = 10  # multiple path instances per noise level
+    instances_per_noise_level = 10
 
     rows: List[Dict[str, Any]] = []
     total_instances = baseline_instances
 
     for i, noise_std in enumerate(noise_levels):
-        # Accumulate more evidence into the SAME graph at this noise level.
         graph.add_evidence(
             irrelevant_concept,
             rng=np.random.default_rng(1 + i),
@@ -237,8 +236,7 @@ def test_sensitivity_path_noise_accumulation_second_concept():
         )
         total_instances += instances_per_noise_level
 
-        # Use the implementation's evidence score directly (no custom scoring in tests).
-        E = graph.evidence_score(base_concept)
+        E = float(graph.evidence_score(base_concept))
 
         rows.append(
             dict(
@@ -246,8 +244,8 @@ def test_sensitivity_path_noise_accumulation_second_concept():
                 noise_std=float(noise_std),
                 instances_added=int(instances_per_noise_level),
                 total_instances=int(total_instances),
-                evidence=float(E),
-                gamma=float(base_concept.gamma),
+                evidence=E,
+                gamma=float(base_concept.gamma_t[1]),
                 tau=float(base_concept.tau),
             )
         )
@@ -256,142 +254,153 @@ def test_sensitivity_path_noise_accumulation_second_concept():
     print(f"\n[path noise accumulation] wrote {out}")
     print("noise_std -> evidence:", [(float(r["noise_std"]), float(r["evidence"])) for r in rows])
 
+
 # ============================================================
 # SECTION 3: Sensitivity tests - Feature component
-# ============================================================
-# Tests that probe how evidence responds to feature centroid mismatches.
 # ============================================================
 
 def test_sensitivity_feature_centroid_shift_sweep_writes_curve():
     """
     Sweep feature centroid shift and measure evidence degradation.
-    
+
     Hypothesis: As feature mismatch increases, evidence should decrease.
-    
-    Method:
-        1. Generate evidence with shifted feature centroids (same structure/time)
-        2. Score against original concept
-        3. Record evidence at each shift distance
-        4. Verify non-increasing monotonicity
     """
     sch = make_schema()
     C = base_concept_r1r2(gamma=5.0, tau=1.0)
 
-    # Direction vector for consistent shift (normalized diagonal)
-    direction = np.array([1.0, 1.0]) / np.sqrt(2.0)
+    # Direction vector for consistent shift (normalized diagonal in feature space)
+    D = C.mu.shape[1]
+    direction = np.ones(D, dtype=float) / np.sqrt(float(D))
 
-    # Sweep shift distances from 0 to 2.0 units
+    # Sweep shift distances
     shifts = np.linspace(0.0, 2.0, 9)
     rows: List[Dict[str, Any]] = []
 
     for s in shifts:
-        # Shift hop-1 and hop-2 centroids in the same direction
-        feature_centroid_shifted = [C.feature_centroid[0]]  # Keep root centroid
-        feature_centroid_shifted.append(C.feature_centroid[1] + s * direction)  # Shift hop 1
-        feature_centroid_shifted.append(C.feature_centroid[2] + s * direction)  # Shift hop 2
+        # Shift hop-1 and hop-2 feature centroids in the same direction
+        mu_shifted = C.mu.copy()
+        if mu_shifted.shape[0] > 1:
+            mu_shifted[1] = C.mu[1] + s * direction
+        if mu_shifted.shape[0] > 2:
+            mu_shifted[2] = C.mu[2] + s * direction
 
-        # Create concept with shifted features
-        C_gen = concept_template(
+        C_gen = Concept(
             name=f"C_gen_feat_shift_{s:.2f}",
-            rel_probs=C.rel_probs,  # Same relation preferences
-            time_deltas=C.time_deltas,  # Same times
-            feature_centroid=feature_centroid_shifted,  # Shifted features
-            gamma=C.gamma,
+            ordered_node_types=C.ordered_node_types,
+            P=C.P.copy(),
+            t=C.t.copy(),
+            gamma_t=C.gamma_t.copy(),
+            mu=mu_shifted,
+            gamma_mu=C.gamma_mu.copy(),
             tau=C.tau,
+            k_time=C.k_time,
+            k_feat=C.k_feat,
         )
-        
-        # Build graph with shifted concept, score with original
+
         g = build_graph(
             sch,
-            root_time=0.0,
-            root_feat=C.feature_centroid[0],
+            root_time=float(C.t[0]),
+            root_feat=C.mu[0],
             planted=[(C_gen, dict(rng=np.random.default_rng(0), instances=1, rel_pick="mode"))],
         )
         E = score(g, C)
-        
-        # Record result
-        rows.append(dict(kind="feat_shift", shift=float(s), evidence=E, gamma=C.gamma, tau=C.tau))
 
-    # Write results to CSV
-    # Columns: kind, shift, evidence, gamma, tau
+        rows.append(
+            dict(
+                kind="feat_shift",
+                shift=float(s),
+                evidence=float(E),
+                gamma=float(C.gamma_mu[1]),
+                tau=float(C.tau),
+            )
+        )
+
     out = write_csv("feature_centroid_shift_sweep.csv", rows)
-    
-    # Verify monotonicity property
+
     ev = np.array([r["evidence"] for r in rows], dtype=float)
     assert nonincreasing(ev, atol=1e-8)
 
-    # Print summary
     print(f"\n[feature centroid] wrote {out}")
     print("shift -> evidence:", [(float(r["shift"]), float(r["evidence"])) for r in rows])
 
 
 # ============================================================
-# SECTION 4: Sensitivity tests - Relation component
-# ============================================================
-# Tests that probe how evidence responds to relation probability changes.
+# SECTION 4: Sensitivity tests - Relational component
 # ============================================================
 
 def test_sensitivity_relation_similarity_sweep_writes_curve():
     """
-    Sweep relation probability mass and measure evidence response.
-    
-    Hypothesis: As probability mass on observed relations increases, evidence increases.
+    Sweep relational probability mass and measure evidence response.
+
+    Hypothesis: As probability mass on the node-types actually used in the
+    planted paths increases, evidence increases.
     """
     sch = make_schema()
 
-    # Build graph: one perfect r1->r2 instance with perfect time/features
+    # Build graph: one perfect base_concept instance
     C_planted = base_concept_r1r2(gamma=5.0, tau=1.0)
     g = build_graph(
         sch,
-        root_time=0.0,
-        root_feat=C_planted.feature_centroid[0],
+        root_time=float(C_planted.t[0]),
+        root_feat=C_planted.mu[0],
         planted=[(C_planted, dict(rng=np.random.default_rng(0), instances=1, rel_pick="mode"))],
     )
+
+    # Identify, per hop, the dominant node-type column for the planted concept
+    L, K = C_planted.P.shape
+    dominant_cols = np.argmax(C_planted.P, axis=1)
 
     # Sweep probability mass from 0.05 to 0.95
     ps = np.linspace(0.05, 0.95, 10)
     rows: List[Dict[str, Any]] = []
 
     for p in ps:
-        # Create concept with varying probability mass
-        # Hop 0: [p for r1, 0, 1-p for rx, 0]
-        # Hop 1: [0, p for r2, 0, 1-p for ry]
-        rel_probs = np.array([
-            [p, 0.0, 1.0 - p, 0.0],
-            [0.0, p, 0.0, 1.0 - p],
-        ], dtype=float)
+        P_score = np.zeros_like(C_planted.P)
+        for i in range(L):
+            j_star = dominant_cols[i]
+            if K == 1:
+                P_score[i, 0] = 1.0
+            else:
+                P_score[i, :] = (1.0 - p) / float(K - 1)
+                P_score[i, j_star] = p
 
-        C_score = concept_template(
+        C_score = Concept(
             name=f"C_score_rel_p_{p:.2f}",
-            rel_probs=rel_probs,  # Varying rel probs
-            time_deltas=C_planted.time_deltas,  # Same times as planted
-            feature_centroid=C_planted.feature_centroid,  # Same features as planted
-            gamma=C_planted.gamma,
+            ordered_node_types=C_planted.ordered_node_types,
+            P=P_score,
+            t=C_planted.t.copy(),
+            gamma_t=C_planted.gamma_t.copy(),
+            mu=C_planted.mu.copy(),
+            gamma_mu=C_planted.gamma_mu.copy(),
             tau=C_planted.tau,
+            k_time=C_planted.k_time,
+            k_feat=C_planted.k_feat,
         )
-        
-        # Score the concept against fixed graph
+
         E = score(g, C_score)
 
-        # Record result with product p*p for reference
-        rows.append(dict(kind="rel_mass", p=float(p), p_product=float(p * p), evidence=E, gamma=C_score.gamma, tau=C_score.tau))
+        rows.append(
+            dict(
+                kind="rel_mass",
+                p=float(p),
+                p_product=float(p ** L),
+                evidence=float(E),
+                gamma=float(C_planted.gamma_t[1]),
+                tau=float(C_planted.tau),
+            )
+        )
 
-    # Write results to CSV
-    # Columns: kind, p, p_product, evidence, gamma, tau
     out = write_csv("relation_similarity_mass_sweep.csv", rows)
 
-    # Verify monotonicity: evidence should increase with relation mass
     ev = np.array([r["evidence"] for r in rows], dtype=float)
     assert bool(np.all(ev[1:] >= ev[:-1] - 1e-10))
 
-    # Print summary
     print(f"\n[relation similarity] wrote {out}")
     print("p -> evidence:", [(float(r["p"]), float(r["evidence"])) for r in rows])
 
+
 # ============================================================
 # SECTION 5: Sensitivity tests - Time + Feature component
-# ============================================================
-# Tests that probe how evidence responds to relation probability changes.
 # ============================================================
 
 def test_sensitivity_stepwise_noise_independent_time_and_feature():
@@ -403,12 +412,6 @@ def test_sensitivity_stepwise_noise_independent_time_and_feature():
     """
     schema = make_schema()
     concept = base_concept_r1r2(gamma=5.0, tau=1.0)
-
-    # NOTE:
-    # This test assumes add_evidence supports per-step noise vectors:
-    #   time_noise_std=[...], feat_noise_std=[...]
-    # If your implementation currently only supports scalars, extend it so that
-    # it broadcasts scalars but accepts sequences of length == concept length.
 
     instances = 40
     replicates = 5
@@ -432,9 +435,8 @@ def test_sensitivity_stepwise_noise_independent_time_and_feature():
         evidences: List[float] = []
 
         for r in range(replicates):
-            # Fresh graph per replicate to keep comparisons fair.
             g = Subgraph(schema=schema)
-            g.create_root(time=0.0, feat=concept.feature_centroid[0])
+            g.create_root(time=float(concept.t[0]), feat=concept.mu[0])
 
             g.add_evidence(
                 concept,
@@ -464,12 +466,11 @@ def test_sensitivity_stepwise_noise_independent_time_and_feature():
                 replicates=int(replicates),
                 evidence_mean=avg,
                 evidence_std=float(np.std(evidences)),
-                gamma=float(concept.gamma),
+                gamma=float(concept.gamma_t[1]),
                 tau=float(concept.tau),
             )
         )
 
-    # Basic ordering checks (soft, but meaningful).
     assert avg_evidence["clean"] >= avg_evidence["time_step0"]
     assert avg_evidence["clean"] >= avg_evidence["time_step1"]
     assert avg_evidence["clean"] >= avg_evidence["feat_step0"]
@@ -482,74 +483,63 @@ def test_sensitivity_stepwise_noise_independent_time_and_feature():
     print(f"\n[stepwise noise profiles] wrote {out}")
     print("profile -> evidence_mean:", [(r["profile"], float(r["evidence_mean"])) for r in rows])
 
+
 # ============================================================
-# SECTION 5: Sensitivity tests - Noise component
-# ============================================================
-# Tests that probe how evidence responds to generation noise with varying gamma.
+# SECTION 6: Sensitivity tests - Noise component
 # ============================================================
 
 @pytest.mark.parametrize("gamma", [1.0, 5.0, 15.0])
 def test_sensitivity_noise_sweep_time_and_feature_writes_curve(gamma: float):
     """
     Sweep generation noise (time and feature) across different gamma values.
-    
+
     Hypothesis: As noise increases, evidence should decrease. Different gamma
-    values should show different sensitivity curves (higher gamma = sharper).
-    
-    Method:
-        1. For each gamma value, sweep noise standard deviation
-        2. Generate evidence with noisy instances (fixed RNG seed)
-        3. Score against original noise-free concept
-        4. Record evidence at each noise level
-        5. Verify non-increasing monotonicity
+    values should show different sensitivity curves.
     """
     sch = make_schema()
     C = base_concept_r1r2(gamma=gamma, tau=1.0)
 
-    # Sweep noise std from 0 to 1.0
     noise = np.linspace(0.0, 1.0, 9)
     rows: List[Dict[str, Any]] = []
 
     for n in noise:
-        # Build graph with noisy evidence instances
         g = build_graph(
             sch,
-            root_time=0.0,
-            root_feat=C.feature_centroid[0],
+            root_time=float(C.t[0]),
+            root_feat=C.mu[0],
             planted=[(C, dict(
                 rng=np.random.default_rng(0),
                 instances=1,
                 rel_pick="mode",
-                time_noise_std=float(n),  # Add time noise
-                feat_noise_std=float(n)   # Add feature noise
+                time_noise_std=float(n),
+                feat_noise_std=float(n),
             ))],
         )
-        
-        # Score noise-free concept against noisy graph
-        E = score(g, C)
-        
-        # Record result
-        rows.append(dict(kind="noise", noise_std=float(n), evidence=E, gamma=C.gamma, tau=C.tau))
 
-    # Write results to CSV
-    # Columns: kind, noise_std, evidence, gamma, tau
+        E = score(g, C)
+
+        rows.append(
+            dict(
+                kind="noise",
+                noise_std=float(n),
+                evidence=float(E),
+                gamma=float(gamma),
+                tau=float(C.tau),
+            )
+        )
+
     out = write_csv(f"noise_sweep_gamma_{gamma:.1f}.csv", rows)
 
-    # Verify monotonicity: evidence should not increase with noise
     ev = np.array([r["evidence"] for r in rows], dtype=float)
     assert nonincreasing(ev, atol=1e-8)
 
-    # Print summary
     print(f"\n[noise sweep] gamma={gamma} wrote {out}")
     print("noise -> evidence:", [(float(r["noise_std"]), float(r["evidence"])) for r in rows])
 
 
 # ============================================================
-# SECTION 5: concept sizes
+# SECTION 7: Concept sizes / coverage
 # ============================================================
-# Tests that probe how evidence responds to generation noise with varying gamma.
-# ============================================================
-
 
 def test_sensitivity_concept_sizes_and_coverage_cases():
     """
@@ -565,99 +555,96 @@ def test_sensitivity_concept_sizes_and_coverage_cases():
     irrelevant = base_concept_rxry(gamma=5.0, tau=1.0)
 
     # Build "r1-only" concept by slicing the first step from the full concept.
-    # (Assumes concept_template matches the helpers used elsewhere in the suite.)
-    r1_only = concept_template(
+    L_full = full.P.shape[0]
+    assert L_full >= 1
+
+    P_r1 = full.P[:1, :]
+    t_r1 = full.t[:2]            # root + first hop
+    gamma_t_r1 = full.gamma_t[:2]
+    mu_r1 = full.mu[:2, :]
+    gamma_mu_r1 = full.gamma_mu[:2]
+
+    r1_only = Concept(
         name="C_r1_only",
-        rel_probs=full.rel_probs[:1],
-        time_deltas=[full.time_deltas[0]],
-        feature_centroid=[full.feature_centroid[0]],
-        gamma=full.gamma,
+        ordered_node_types=full.ordered_node_types,
+        P=P_r1,
+        t=t_r1,
+        gamma_t=gamma_t_r1,
+        mu=mu_r1,
+        gamma_mu=gamma_mu_r1,
         tau=full.tau,
+        k_time=full.k_time,
+        k_feat=full.k_feat,
     )
 
-    # ------------------------------------------------------------
-    # Case A: Graph contains full concept evidence (r1->r2).
-    # ------------------------------------------------------------
+    # Case A: Graph contains full concept evidence
     g_full = build_graph(
         schema,
-        root_time=0.0,
-        root_feat=full.feature_centroid[0],
+        root_time=float(full.t[0]),
+        root_feat=full.mu[0],
         planted=[(full, dict(rng=np.random.default_rng(0), instances=25, rel_pick="mode"))],
     )
 
     E_full = float(g_full.evidence_score(full))
-    E_partial = float(g_full.evidence_score(r1_only))      # only part of the structure required
-    E_irrelevant = float(g_full.evidence_score(irrelevant)) # relations not in the graph
+    E_partial = float(g_full.evidence_score(r1_only))
+    E_irrelevant = float(g_full.evidence_score(irrelevant))
 
     assert 0.0 <= E_full <= 1.0
     assert 0.0 <= E_partial <= 1.0
     assert 0.0 <= E_irrelevant <= 1.0
 
-    # Required: relation-not-in-graph should score worst.
+    # Relation-not-in-graph should score worst
     assert E_full > E_irrelevant
     assert E_partial > E_irrelevant
 
-    # ------------------------------------------------------------
-    # Case B: Graph contains only r1-only evidence; score longer concept (r1->r2).
-    # ------------------------------------------------------------
+    # Case B: Graph contains only r1-only evidence; score longer concept
     g_r1 = build_graph(
         schema,
-        root_time=0.0,
-        root_feat=r1_only.feature_centroid[0],
+        root_time=float(r1_only.t[0]),
+        root_feat=r1_only.mu[0],
         planted=[(r1_only, dict(rng=np.random.default_rng(1), instances=25, rel_pick="mode"))],
     )
 
     E_r1_on_r1 = float(g_r1.evidence_score(r1_only))
-    E_full_on_r1 = float(g_r1.evidence_score(full))  # concept longer than any present in graph
+    E_full_on_r1 = float(g_r1.evidence_score(full))
 
     assert 0.0 <= E_r1_on_r1 <= 1.0
     assert 0.0 <= E_full_on_r1 <= 1.0
 
-    # Required: longer-than-graph should be penalized relative to the matching shorter concept.
+    # Longer-than-graph should be penalized relative to the matching shorter concept.
     assert E_r1_on_r1 > E_full_on_r1
 
     print("\n[concept coverage cases]")
-    print(f"full graph:     E_full={E_full:.4f}, E_partial={E_partial:.4f}, E_irrelevant={E_irrelevant:.4f}")
-    print(f"r1-only graph:  E_r1_on_r1={E_r1_on_r1:.4f}, E_full_on_r1={E_full_on_r1:.4f}")
-    
-    
+    print(
+        f"full graph:     E_full={E_full:.4f}, "
+        f"E_partial={E_partial:.4f}, E_irrelevant={E_irrelevant:.4f}"
+    )
+    print(
+        f"r1-only graph:  E_r1_on_r1={E_r1_on_r1:.4f}, "
+        f"E_full_on_r1={E_full_on_r1:.4f}"
+    )
+
+
 # ============================================================
-# SECTION 6: Sensitivity tests - Multiple concepts (mixtures)
-# ============================================================
-# Tests that probe evidence behavior with multiple generating concepts.
+# SECTION 8: Multiple generating concepts (mixtures)
 # ============================================================
 
 def test_sensitivity_multiple_generating_concepts_mixture_table():
     """
     Plant two distinct concepts and measure each concept's evidence response
     to mixture proportions.
-    
+
     Hypothesis: Evidence should scale with number of matching instances.
-    Potential failure modes:
-        - Evidence inflation from unrelated branching paths
-        - Cross-concept confusion if time/features are close but relations differ
-    
-    Method:
-        1. Create two orthogonal concepts (r1r2 and rxry)
-        2. Sweep grid of instance counts for each concept
-        3. Build graph at each grid point with neutral root
-        4. Measure evidence for both concepts
-        5. Verify that evidence scales with matching instances
     """
     sch = make_schema()
-    
-    # Concept A: prefers r1->r2
+
     A = base_concept_r1r2(gamma=5.0, tau=1.0)
-    
-    # Concept B: prefers rx->ry (orthogonal)
     B = base_concept_rxry(gamma=5.0, tau=1.0)
 
-    # Create grid of instance counts
     grid = [(a, b) for a in [0, 1, 2, 4] for b in [0, 1, 2, 4]]
     rows: List[Dict[str, Any]] = []
 
     for a, b in grid:
-        # Build planting list based on instance counts
         planted = []
         if a > 0:
             planted.append((A, dict(
@@ -665,7 +652,7 @@ def test_sensitivity_multiple_generating_concepts_mixture_table():
                 instances=int(a),
                 rel_pick="mode",
                 time_noise_std=0.0,
-                feat_noise_std=0.0
+                feat_noise_std=0.0,
             )))
         if b > 0:
             planted.append((B, dict(
@@ -673,40 +660,50 @@ def test_sensitivity_multiple_generating_concepts_mixture_table():
                 instances=int(b),
                 rel_pick="mode",
                 time_noise_std=0.0,
-                feat_noise_std=0.0
+                feat_noise_std=0.0,
             )))
 
-        # Build graph with neutral root (intentional mismatch to isolate effect)
+        # Neutral root to isolate effect of planted paths
         g = build_graph(
             sch,
             root_time=0.0,
-            root_feat=np.array([0.0, 0.0]),
+            root_feat=np.zeros_like(A.mu[0]),
             planted=planted,
         )
 
-        # Score both concepts
         EA = score(g, A)
         EB = score(g, B)
 
-        # Record result
-        rows.append(dict(instances_A=int(a), instances_B=int(b), evidence_A=EA, evidence_B=EB, gamma=5.0, tau=1.0))
+        rows.append(
+            dict(
+                instances_A=int(a),
+                instances_B=int(b),
+                evidence_A=float(EA),
+                evidence_B=float(EB),
+                gamma=5.0,
+                tau=1.0,
+            )
+        )
 
-    # Write results to CSV
-    # Columns: instances_A, instances_B, evidence_A, evidence_B, gamma, tau
     out = write_csv("mixture_two_concepts_instances_grid.csv", rows)
 
-    # Verify evidence is in valid range [0, 1]
     for r in rows:
         assert 0.0 <= r["evidence_A"] <= 1.0
         assert 0.0 <= r["evidence_B"] <= 1.0
 
-    # Verify monotonicity on A-axis when B is fixed at 0
-    # (increasing A instances should not decrease EA)
-    rows_b0 = sorted([r for r in rows if r["instances_B"] == 0], key=lambda d: d["instances_A"])
+    rows_b0 = sorted(
+        [r for r in rows if r["instances_B"] == 0],
+        key=lambda d: d["instances_A"],
+    )
     EA_b0 = np.array([r["evidence_A"] for r in rows_b0], dtype=float)
     assert bool(np.all(EA_b0[1:] >= EA_b0[:-1] - 1e-10))
 
-    # Print summary
     print(f"\n[multiple concepts] wrote {out}")
-    print("instances_A, instances_B -> (EA, EB):",
-          [(r["instances_A"], r["instances_B"], round(r["evidence_A"], 4), round(r["evidence_B"], 4)) for r in rows])
+    print(
+        "instances_A, instances_B -> (EA, EB):",
+        [
+            (r["instances_A"], r["instances_B"],
+             round(r["evidence_A"], 4), round(r["evidence_B"], 4))
+            for r in rows
+        ],
+    )

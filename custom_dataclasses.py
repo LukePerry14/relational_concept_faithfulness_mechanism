@@ -4,101 +4,136 @@ import numpy as np
 
 NodeId = int
 
+NULL_TOKEN = "∅"
+MISSING_TIME = 1e6
+MISSING_FEAT = 1e6
+EPS = 1e-12
+DEFAULT_TAU = 0.5
 
 @dataclass(frozen=True)
 class Node:
     id: NodeId
     node_type: str
     time: float
-    feature_embedding: np.ndarray
+    feature: np.ndarray  # shape (D,)
 
 
 @dataclass(frozen=True)
 class Edge:
-    source: NodeId
-    destination: NodeId
+    src: NodeId
+    dst: NodeId
     relation: str
 
 
-@dataclass(frozen=True)
+@dataclass
 class Schema:
     root_type: str
-    transitions: Dict[Tuple[str, str], str]
-
-    def check(self, source_type: str, relation: str, destination_type: str) -> None:
-        exp = self.transitions.get((source_type, relation))
-        if exp is None:
-            raise ValueError(f"Relation not allowed by schema: ({source_type}) -[{relation}]-> (?)")
-        if exp != destination_type:
-            raise ValueError(f"Schema mismatch: ({source_type}) -[{relation}]-> ({destination_type}), expected ({exp})")
+    transitions: Dict[str, List[str]] # src_type -> [dst_types].
 
 
-@dataclass(frozen=True)
+    def reachability_mask(self, L: int, ordered_node_types: List[str]) -> np.ndarray:
+        """
+        Build the reachability mask. the output is formatted according to the order of nodes given in `ordered_node_types`
+        
+        L is the size of the HOP NEIGHBOURHOOD (number of nodes in the metapath - 1)
+        """
+        cols = ordered_node_types + [NULL_TOKEN]
+        X = np.zeros((L, len(cols)), dtype=float)
+
+        
+        current = set()
+        current.add(self.root_type)
+        
+        for hop in range(L):
+            
+            reachable_next = set()
+            
+            for node in current:
+                reachable_next = reachable_next | set(self.transitions.get(node, {}))
+
+            reachable_next.add(NULL_TOKEN)
+
+            for j, t in enumerate(cols):
+                X[hop, j] = 1.0 if t in reachable_next else 0.0
+            
+            reachable_next.discard(NULL_TOKEN)
+            
+            current = reachable_next.copy()
+
+
+        return X
+
+
+@dataclass
+class MetaPath:
+    path_name: Optional[str]
+    node_types: List[str]
+    node_times: np.ndarray
+    node_features: np.ndarray
+
+    def __repr__(self):
+        return (
+            f"MetaPath(\n"
+            f"  path_name={self.path_name!r},\n"
+            f"  node_types={self.node_types},\n"
+            f"  node_times={self.node_times},\n"
+            f"  node_features={self.node_features.shape}\n"
+            f")"
+        )
+
+@dataclass
 class Concept:
     """
-    rel_probs: shape (L, R), rows are distributions over rel_types.
-    feature_centroid: length L+1 (includes root at index 0).
-    time_deltas: length L.
+    Prototype concept as described in the walkthrough.
+
+    ordered_node_types:
+        List of node types T = [t1, ..., tK]. An extra column for NULL_TOKEN
+        is appended internally when constructing P, X, and M.
+
+    P:
+        Relational prototype distribution over node types and NULL_TOKEN.
+        Shape (L, |T| + 1), rows = hops 1..L, columns = ordered_node_types + [NULL_TOKEN].
+        Each row is a probability distribution.
+
+    t:
+        Time prototype, shape (L+1,).
+        t[0] is the absolute prototype time of the root.
+        t[1:] are prototype offsets (relative to root) for hops 1..L.
+
+    gamma_t:
+        Time window radii, shape (L+1,). Use np.inf to ignore a given hop.
+
+    mu:
+        Feature prototype, shape (L+1, D).
+        mu[0] is the prototype feature of the root node.
+        mu[1:] are prototype features for hops 1..L.
+
+    gamma_mu:
+        Feature window radii, shape (L+1,). Use np.inf to ignore a given hop.
+
+    tau:
+        Saturation parameter in E = M / (M + tau). If None, DEFAULT_TAU is used.
+        Keeping it fixed implements the basic mechanism; making it
+        per-concept enables later learning or tying to gamma_·.
+
+    k_time, k_feat:
+        Similarity at distance == gamma (0 < k < 1). Controls steepness
+        of the RBF-like kernels.
     """
     name: str
-    relation_types: List[str]
-    relation_probs: np.ndarray
-    time_deltas: List[float]
-    feature_centroid: List[np.ndarray]
-    gamma: float = 1.0
-    tau: float = 0.0
-
-    gamma_time: Optional[Sequence[float]] = None
-    gamma_feat: Optional[Sequence[float]] = None
-
-    def __post_init__(self) -> None:
-        rp = np.asarray(self.relation_probs, dtype=float)
-        if rp.ndim != 2:
-            raise ValueError("relation_probs must be a 2D array of shape (L, R).")
-        L, R = rp.shape
-        if R != len(self.relation_types):
-            raise ValueError("rel_probs second dimension must equal len(relation_types).")
-        if len(self.time_deltas) != L:
-            raise ValueError("time_deltas must have length L (same as relation_probs.shape[0]).")
-        if len(self.feature_centroid) != L + 1:
-            raise ValueError("feature_centroid must have length L+1 (including root).")
-        if np.any(rp < 0):
-            raise ValueError("relation_probs must be non-negative.")
-        row_sums = rp.sum(axis=1, keepdims=True)
-        if np.any(row_sums == 0):
-            raise ValueError("Each row of relation_probs must sum to > 0.")
-        # Normalize to be safe (keeps it continuous and well-defined)
-        rp = rp / row_sums
-        object.__setattr__(self, "relation_probs", rp)
+    ordered_node_types: List[str]
+    P: np.ndarray
+    t: np.ndarray
+    gamma_t: np.ndarray
+    mu: np.ndarray
+    gamma_mu: np.ndarray
+    tau: Optional[float] = None
+    k_time: float = 0.1
+    k_feat: float = 0.1
 
     def L(self) -> int:
-        return int(self.relation_probs.shape[0])
+        return int(self.P.shape[0])
 
-    def relation_index(self) -> Dict[str, int]:
-        return {r: i for i, r in enumerate(self.relation_types)}
-    
-    def _as_gamma_vec(self, maybe_vec: Optional[Sequence[float]], L: int, default: float) -> np.ndarray:
-        if maybe_vec is None:
-            return np.full(L, float(default), dtype=float)
-        arr = np.asarray(maybe_vec, dtype=float).reshape(-1)
-        if arr.size == 1:
-            return np.full(L, float(arr.item()), dtype=float)
-        if arr.size != L:
-            raise ValueError(f"Expected gamma vector of length {L}, got {arr.size}.")
-        return arr
-
-    def gamma_time_vec(self) -> np.ndarray:
-        return self._as_gamma_vec(self.gamma_time, self.L(), self.gamma)
-
-    def gamma_feat_vec(self) -> np.ndarray:
-        return self._as_gamma_vec(self.gamma_feat, self.L(), self.gamma)
-
-    def gamma_root_scalar(self) -> float:
-        return float(self.gamma if self.gamma_root is None else self.gamma_root)
-
-
-@dataclass(frozen=True)
-class PathSample:
-    relation_sequence: List[str]
-    time_vector: np.ndarray
-    feature_vector: np.ndarray
+    def type_index(self) -> Dict[str, int]:
+        cols = self.ordered_node_types + [NULL_TOKEN]
+        return {t: i for i, t in enumerate(cols)}
