@@ -385,13 +385,21 @@ class Subgraph:
         sample_mu: np.ndarray,
         gamma_mu: np.ndarray,
         k: float,
+        use_cosine: bool = True,
     ) -> float:
         """
-        RBF-like feature kernel:
+        RBF-like feature kernel with selectable distance metric:
 
-        For each hop i:
-          d_i² = ||μ_i - μ̂_i||²
-          contribution = d_i² / γ_μ_i²
+        If use_cosine=False (Euclidean distance, default):
+          For each hop i:
+            d_i² = ||μ_i - μ̂_i||²
+            contribution = d_i² / γ_μ_i²
+
+        If use_cosine=True (cosine distance):
+          For each hop i:
+            cos_sim_i = (μ_i · μ̂_i) / (||μ_i|| * ||μ̂_i||)
+            cos_dist_i = 1 - cos_sim_i
+            contribution = cos_dist_i / γ_μ_i²
 
         S_feat = exp( ln(k) * Σ_i contribution )
 
@@ -409,10 +417,10 @@ class Subgraph:
         if not (0.0 < k < 1.0):
             raise ValueError(f"k must be in (0,1), got {k}")
 
-        Lp1, D = proto_mu.shape
+        metapath_length, D = proto_mu.shape
         contribs: List[float] = []
 
-        for i in range(Lp1):
+        for i in range(metapath_length):
             g_i = gamma_mu[i]
             if not np.isfinite(g_i):
                 continue  # ignored hop
@@ -422,10 +430,30 @@ class Subgraph:
             if not np.any(np.isfinite(sample_mu[i])):
                 continue  # missing sample at this hop
 
-            diff = proto_mu[i] - sample_mu[i]
-            d2 = float(np.dot(diff, diff))
             g2 = max(g_i ** 2, EPS)
-            contribs.append(d2 / g2)
+            
+            if use_cosine:
+                # Cosine distance metric
+                proto_vec = proto_mu[i]
+                sample_vec = sample_mu[i]
+                
+                # Compute norms
+                proto_norm = float(np.linalg.norm(proto_vec))
+                sample_norm = float(np.linalg.norm(sample_vec))
+                
+                # Avoid division by zero
+                if proto_norm > EPS and sample_norm > EPS:
+                    cos_sim = float(np.dot(proto_vec, sample_vec)) / (proto_norm * sample_norm)
+                    # Clamp to [-1, 1] to handle numerical errors
+                    cos_sim = np.clip(cos_sim, -1.0, 1.0)
+                    # Convert similarity to distance: larger distance for lower similarity
+                    cos_dist = 1.0 - cos_sim
+                    contribs.append(cos_dist / g2)
+            else:
+                # Euclidean distance metric (original)
+                diff = proto_mu[i] - sample_mu[i]
+                d2 = float(np.dot(diff, diff))
+                contribs.append(d2 / g2)
 
         if not contribs:
             return 1.0

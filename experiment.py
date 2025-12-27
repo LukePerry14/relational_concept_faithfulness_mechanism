@@ -1,7 +1,3 @@
-# Initial testing to ensure new version accuracy
-
-# Add node feature embeddings using BERT
-
 # experiment with taus
 
 # add in gradient descent
@@ -17,6 +13,25 @@ from faithfulness_poc import Subgraph
 from transformers import AutoTokenizer, AutoModel
 import torch
 from embedding_viz import compare_embeddings
+
+
+# Get embeddings for target words
+def get_bert_embeddings(words):
+    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+    model = AutoModel.from_pretrained("bert-base-uncased", output_hidden_states=True)
+    
+    # Process each word individually
+    embeddings = []
+    for word in words:
+        inputs = tokenizer(word, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        # Extract embedding for the word token (position 1, after [CLS])
+        embedding = outputs.hidden_states[-1][0, 1, :].numpy()
+        embeddings.append(embedding)
+    
+    return np.array(embeddings)
+    
 
 def build_buys_nappies_concept(ordered_node_types):
     buys_nappies_relations = np.asarray([
@@ -73,43 +88,73 @@ def build_graph_evidence():
     
     return [recent_nappy_purchase, distant_nappy_purchase, recent_irrelevant_purchase, subscription_to_baby_newsletter]
     
+def build_graph_evidence_BERT():
+    
+    embs = get_bert_embeddings(["adult", "[CLS]", "diapers", "nappies", "baby newsletter"])
+    adult_emd = embs[0]
+    irrelevant_emd = embs[0]
+    diapers_emd = embs[0]
+    nappies_emd = embs[0]
+    baby_newsletter_emd = embs[0]
 
-def build_graph_evidence_with_BERT(ordered_node_types):
-    # Load BERT model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    model = AutoModel.from_pretrained("bert-base-uncased", output_hidden_states=True)
-    
-    # Get embeddings for target words
-    def get_bert_embedding(word):
-        inputs = tokenizer(word, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs)
-        return outputs.hidden_states[-1][0, 1, :].numpy()  # [CLS] token embedding
-    
-    parent_embedding = get_bert_embedding("parent")
-    diapers_embedding = get_bert_embedding("diapers")
-    nappies_embedding = get_bert_embedding("nappies")
-    baby_newsletter_embedding = get_bert_embedding("baby newsletter")
-    irrelevant_embedding = get_bert_embedding("irrelevant")
-    uninformative_embedding = get_bert_embedding("uninformative")
-
-    
-    compare_embeddings(
-        embeddings=[parent_embedding, diapers_embedding, nappies_embedding, baby_newsletter_embedding, uninformative_embedding, irrelevant_embedding],
-        labels=["parent", "diapers", "nappies", "baby newsletter", "[PAD]", "irrelevant"],
-        show_plots=True
+    recent_diaper_purchase = MetaPath(
+        path_name="recent_nappy_purchase",
+        node_types=["orders", "products"],
+        node_times=[1, 500],
+        node_features=np.asarray([irrelevant_emd, diapers_emd])
     )
-    # print("Parent Embedding:", parent_embedding)
-    # print("Diapers Embedding:", diapers_embedding)
-    # print("Uninformative Embedding:", uninformative_embedding)
-    exit()
+    distant_nappy_purchase = MetaPath(
+        path_name="distant_nappy_purchase",
+        node_types=["orders", "products"],
+        node_times=[11, 500],
+        node_features=np.asarray([irrelevant_emd, diapers_emd])
+    )
+    recent_nappy_purchase = MetaPath(
+        path_name="recent_nappy_purchase",
+        node_types=["orders", "products"],
+        node_times=[1, 500],
+        node_features=np.asarray([irrelevant_emd, nappies_emd])
+    )
+    recent_irrelevant_purchase = MetaPath(
+        path_name="recent_irrelevant_purchase",
+        node_types=["orders", "products"],
+        node_times=[1, 500],
+        node_features=np.asarray([irrelevant_emd, irrelevant_emd])
+    )
+    subscription_to_baby_newsletter = MetaPath(
+        path_name = "subscription_to_baby_newsletter",
+        node_types=["subscriptions", "subscriptionProducts", "products"],
+        node_times=[10, 500, 500],
+        node_features=np.asarray([irrelevant_emd, irrelevant_emd, baby_newsletter_emd])
+    )
+    
+    return [recent_nappy_purchase, distant_nappy_purchase, recent_diaper_purchase, recent_irrelevant_purchase, subscription_to_baby_newsletter]
+    
+    
+def build_graph_concept_with_BERT(ordered_node_types):
+    
+
+    embs = get_bert_embeddings(["parent", "[CLS]", "diapers"])
+    parent_embedding = embs[0]
+    uninformative_embedding = embs[1]
+    diapers_embedding = embs[2]
+    
+    
+    # compare_embeddings(
+    #     embeddings=[parent_embedding, uninformative_embedding, diapers_embedding],
+    #     labels=["parent", "irrelevant", "diapers"],
+    #     show_plots=True
+    # )
+
     buys_nappies_mu = np.asarray([
         parent_embedding,
         uninformative_embedding,
         diapers_embedding,
         uninformative_embedding
     ])
-    buys_nappies_mu_gamma = np.asarray([2, float('inf'), 0.5, float('inf')])
+    # 7.35680521e-01, -5.22486866e-03,  2.59613812e-01, (proto)
+    # -1.19801593e+00, -1.59482241e-01, -5.89826703e-01 (sample)
+    buys_nappies_mu_gamma = np.asarray([0.5, float('inf'), 0.5, float('inf')])
 
     buys_nappies_concept = Concept(
         name="buys nappies",
@@ -127,6 +172,49 @@ def build_graph_evidence_with_BERT(ordered_node_types):
     return buys_nappies_concept
 
 
+def lambda_regression_paths():
+    
+    embs = get_bert_embeddings(["adult", "[CLS]", "diapers", "nappies", "baby newsletter"])
+    adult_emd = embs[0]
+    irrelevant_emd = embs[0]
+    diapers_emd = embs[0]
+    nappies_emd = embs[0]
+    baby_newsletter_emd = embs[0]
+
+    recent_diaper_purchase = MetaPath(
+        path_name="recent_nappy_purchase",
+        node_types=["orders", "products"],
+        node_times=[1, 500],
+        node_features=np.asarray([irrelevant_emd, diapers_emd])
+    )
+    distant_nappy_purchase = MetaPath(
+        path_name="distant_nappy_purchase",
+        node_types=["orders", "products"],
+        node_times=[11, 500],
+        node_features=np.asarray([irrelevant_emd, diapers_emd])
+    )
+    recent_nappy_purchase = MetaPath(
+        path_name="recent_nappy_purchase",
+        node_types=["orders", "products"],
+        node_times=[1, 500],
+        node_features=np.asarray([irrelevant_emd, nappies_emd])
+    )
+    recent_irrelevant_purchase = MetaPath(
+        path_name="recent_irrelevant_purchase",
+        node_types=["orders", "products"],
+        node_times=[1, 500],
+        node_features=np.asarray([irrelevant_emd, irrelevant_emd])
+    )
+    subscription_to_baby_newsletter = MetaPath(
+        path_name = "subscription_to_baby_newsletter",
+        node_types=["subscriptions", "subscriptionProducts", "products"],
+        node_times=[10, 500, 500],
+        node_features=np.asarray([irrelevant_emd, irrelevant_emd, baby_newsletter_emd])
+    )
+    
+    return [[recent_nappy_purchase, distant_nappy_purchase, recent_diaper_purchase, recent_irrelevant_purchase, subscription_to_baby_newsletter],[]]
+    
+
 
 if __name__ == "__main__":
     # Build Schema (Customer, Review, Product)
@@ -143,23 +231,32 @@ if __name__ == "__main__":
     ordered_node_types = ["orders", "subscriptions", "subscriptionProducts", "products"]
     
     # reachability_mask = amazon_schema.reachability_mask(3, ordered_node_types)
-
+    
+    
     # Build Subgraph (4 metapath types in pdf)
     amazon_has_baby = Subgraph(
         schema=amazon_schema
     )
-    amazon_has_baby.create_root(time=100, feat=np.asanyarray([-0.5,-0.5]))
+    amazon_has_baby.create_root(time=100, feat=np.asanyarray(get_bert_embeddings(["adult"])[0]))
+    # BERT_metapaths = build_graph_evidence_BERT()
+    # amazon_has_baby.add_evidence(BERT_metapaths)
+
+
+    amazon_no_baby = Subgraph(
+        schema=amazon_schema
+    )
+    amazon_no_baby.create_root(time=300, feat=np.asanyarray(get_bert_embeddings(["child"])[0]))
     
-    metapaths = build_graph_evidence()
+    # metapaths = build_graph_evidence()
     
-    amazon_has_baby.add_evidence(metapaths)
+    # amazon_has_baby.add_evidence(metapaths)
     
     # amazon_has_baby.visualize_subgraph_plotly()
-    input("Press Enter to Continue...")
-    # print(amazon_has_baby.sample_paths(3, 4))
+
     # Build buying nappies concept
-    buys_nappies_concept = build_graph_evidence_with_BERT(ordered_node_types)
+
     
+    buys_nappies_concept = build_graph_concept_with_BERT(ordered_node_types)
     total_evidence = amazon_has_baby.evidence_score(buys_nappies_concept)
     print(f"Total Evidence for 'buys nappies' concept: {total_evidence:.4f}")
     # Build subscribes to newsletter concept
@@ -167,4 +264,27 @@ if __name__ == "__main__":
     # Test concepts
     
 
-# absolute time and relative time both important
+
+# regress lambda based on toy dataset
+
+# multiple concepts
+
+# sparse concepts
+
+# full toy dataset
+
+# lamvda + concepts
+
+# sparse concepts
+
+# real data performance
+
+# competitive performance
+
+    """
+    
+    keep track of:
+    
+    - absolute time and relative time both important - resolved?
+
+    """
