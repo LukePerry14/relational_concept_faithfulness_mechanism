@@ -107,9 +107,20 @@ def compare_embeddings(embeddings: list, labels: list | None = None, show_plots:
     return {"cosine": cosm, "euclidean": eucm, "pca2d": pts}
 
 
-if __name__ == "__main__":
-    # Quick demo: random vectors
-    rng = np.random.default_rng(1)
-    A = rng.normal(size=(3, 64))
-    labels = ["A", "B", "C"]
-    compare_embeddings([A[0], A[1], A[2]], labels)
+def compare_metapath_feature_embeddings(paths):
+    unique_embeddings = []
+    unique_labels = []
+    seen_vectors = set()
+
+    # 2. Extract unique node embeddings from the MetaPaths
+    for path in paths:
+        for i, feat in enumerate(path.node_features):
+            # Create a hashable version to check for uniqueness
+            feat_id = tuple(feat.round(5).flatten()) 
+            if feat_id not in seen_vectors:
+                unique_embeddings.append(feat)
+                # Label with node type and path source for context
+                unique_labels.append(f"{path.node_types[i]} ({path.path_name})")
+                seen_vectors.add(feat_id)
+
+    compare_embeddings(unique_embeddings, unique_labels)

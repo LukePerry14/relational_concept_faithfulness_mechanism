@@ -212,36 +212,26 @@ class Subgraph:
 
     def sample_paths(self, max_hops, n_samples=128, rng=None):
         """
-        We want to sample meta-paths from the immediate surroundings. The number of possible meta-paths allowing for truncations is combinatorial,
-        instead, we sample up to the maximum and allow gamma to ignore irrelevant structural nodes
-
-        Current strategy is enumerate all neighbours then sample, might need to change to stochastic DFS if too many paths
+        Updated to align with Concept signatures:
+        - All signatures are length max_hops + 1.
+        - Index 0 is always the root node.
         """
         if self.root is None:
             raise ValueError("Root not set. Call create_root(...) first.")
 
         rng = rng or np.random.default_rng()
-
         root_id = self.root
-        root_node = self.nodes[root_id]
-        root_time = float(root_node.time)
-        root_feat = root_node.feature
         D = self.D
 
-        # ---- Step 1: enumerate all simple maximal paths up to max_hops ----
+        # ---- Step 1: Enumerate all simple maximal paths up to max_hops ----
         all_paths: List[List[int]] = []
         seen_paths: set[tuple[int, ...]] = set()
 
         def dfs(path: List[int]) -> None:
-            """
-            path is a list of node IDs [root, ..., v_k].
-            depth = number of hops from root = len(path) - 1.
-            """
             depth = len(path) - 1
             current = path[-1]
             out_edges = self.adj.get(current, [])
 
-            # Decide if this path is "maximal" (cannot/should not be extended)
             is_max_length = depth >= max_hops
             is_dead_end = len(out_edges) == 0
 
@@ -251,13 +241,10 @@ class Subgraph:
                     seen_paths.add(key)
                     all_paths.append(path.copy())
 
-            # If we've hit max_hops, do not extend further
             if is_max_length:
                 return
 
-            # Otherwise, we can still extend (only from non-dead-ends)
             for _rel, dst in out_edges:
-                # avoid cycles: simple paths only
                 if dst in path:
                     continue
                 path.append(dst)
@@ -269,7 +256,7 @@ class Subgraph:
         if not all_paths:
             return []
 
-        # ---- Step 2: subsample without replacement if needed ----
+        # ---- Step 2: Subsample paths ----
         num_paths = len(all_paths)
         if num_paths > n_samples:
             idx = rng.choice(num_paths, size=n_samples, replace=False)
@@ -278,43 +265,30 @@ class Subgraph:
             rng.shuffle(all_paths)
             chosen_paths = all_paths
 
-        # ---- Step 3: convert to MetaPath with consistent lengths ----
+        # ---- Step 3: Convert to MetaPath with consistent lengths (L+1) ----
         samples: List[MetaPath] = []
 
         for path in chosen_paths:
-            # path = [root, v1, ..., v_k], with 1 <= k <= max_hops
-            node_ids = path[1:]
-            hop_count = len(node_ids)
-
-            # node_types: length max_hops, pad with NULL_TOKEN
+            # path is [root, v1, ..., vk]
+            actual_len = len(path)
+            
+            # node_types: Include root at index 0, pad to max_hops + 1
             node_types: List[str] = []
-            for h in range(max_hops):
-                if h < hop_count:
-                    node_types.append(self.nodes[node_ids[h]].node_type)
+            for h in range(max_hops + 1):
+                if h < actual_len:
+                    node_types.append(self.nodes[path[h]].node_type)
                 else:
                     node_types.append(NULL_TOKEN)
 
-            # node_times: [root_time, offsets...] padded to max_hops+1
-            offsets: List[float] = []
-            for nid in node_ids:
-                v_node = self.nodes[nid]
-                # Keep absolute times (distance from present day), not offsets
-                offsets.append(float(v_node.time))
-
+            # node_times: Include root at index 0, pad to max_hops + 1
             t_sig = np.full((max_hops + 1,), self.MISSING_TIME, dtype=float)
-            t_sig[0] = root_time
-            if offsets:
-                t_sig[1 : 1 + len(offsets)] = np.asarray(offsets, dtype=float)
+            for h in range(actual_len):
+                t_sig[h] = float(self.nodes[path[h]].time)
 
-            # node_features: [root_feat, feats...] padded to max_hops+1
-            feats: List[np.ndarray] = []
-            for nid in node_ids:
-                feats.append(self.nodes[nid].feature)
-
+            # node_features: Include root at index 0, pad to max_hops + 1
             mu_sig = np.full((max_hops + 1, D), self.MISSING_FEAT, dtype=float)
-            mu_sig[0] = root_feat
-            if feats:
-                mu_sig[1 : 1 + len(feats)] = np.stack(feats, axis=0).astype(float)
+            for h in range(actual_len):
+                mu_sig[h] = self.nodes[path[h]].feature
 
             samples.append(
                 MetaPath(
@@ -513,22 +487,17 @@ class Subgraph:
 
         mass = 0.0
         for p in paths:
-            if p.node_types[0] == "subscriptions":
-                print("here")
             # Build M: L × K one-hot over node types + NULL_TOKEN
             M = np.zeros((L, K), dtype=float)
             valid = True
             for hop in range(L):
-                if hop < len(p.node_types):
-                    t = p.node_types[hop]
-                else:
-                    t = NULL_TOKEN
+                t = p.node_types[hop + 1] 
                 j = type_idx.get(t)
                 if j is None:
-                    # Type not in prototype vocabulary => ignore this path
                     valid = False
                     break
                 M[hop, j] = 1.0
+            
             if not valid:
                 continue
 
@@ -554,7 +523,7 @@ class Subgraph:
             if s_feat <= 0.0:
                 continue
             
-            print(f"Path: {p.node_types}, S_rel={s_rel:.4f}, S_time={s_time:.4f}, S_feat={s_feat:.4f}, total={s_rel * s_time * s_feat:.4f}")
+            # print(f"Path: {p.path_name}, S_rel={s_rel:.4f}, S_time={s_time:.4f}, S_feat={s_feat:.4f}, total={s_rel * s_time * s_feat:.4f}")
             mass += float(s_rel * s_time * s_feat)
 
         tau = concept.tau if concept.tau is not None else DEFAULT_TAU
