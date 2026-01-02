@@ -5,14 +5,54 @@ import math
 from dataclasses import dataclass
 import unittest
 
-# class ConceptDecoder(nn.Module):
-#     def __init__(self, embedding_dim, max_hops, num_relations, valid_hops_mask):
-#         super().__init__()
-#         self.embedding_dim = embedding_dim
+class ConceptDecoder(nn.Module):
+    def __init__(self, z_dim, embed_dim, max_hops, max_relations):
+        super().__init__()
 
-#         self.decoder = nn.
+        # maybe more sophisticated method of handling discrete path generation using MolGAN style generation?
+        # https://arxiv.org/abs/1805.11973
 
-#     def forward(self, )
+        # At this point we look to optimise the embedding space directly, this will eventually be swapped out for a NN operating on the graph data
+        self.trunk = nn.Sequential(
+            nn.Linear(z_dim, z_dim * 4),
+            nn.GELU(),
+            nn.Linear(z_dim * 4, z_dim * 2)
+        )
+                
+        # Relation Head: Output [4, 3] (logits for softmax)
+        self.relation_head = nn.Linear(z_dim * 2, max_hops * max_relations+1)
+        
+        # Time/Gamma Head: Output [3] (mu), [3] (gamma_mu), [3] (gamma_t)
+        # Total size = 9
+        self.meta_head = nn.Linear(z_dim * 2, 9)
+        
+        # Feature Head: Output [3, D]
+        self.feature_head = nn.Linear(z_dim * 2, 3 * embed_dim)
+
+    def forward(self, z):
+        # 1. Expand Latent
+        concept_state = self.trunk(z)
+        
+        # 2. Decode Relations (Apply Softmax/Gumbel)
+        rel_flat = self.relation_head(concept_state)
+        # Reshape to [Batch, 4, 3] and apply Softmax on last dim
+        P = F.softmax(rel_flat.view(-1, 4, 3), dim=-1)
+        
+        # 3. Decode Meta (Time/Gammas) (Apply Softplus)
+        meta_flat = self.meta_head(concept_state)
+        # Split into components
+        t, gamma_t, gamma_mu = torch.split(meta_flat, 3, dim=1)
+        # Enforce constraints
+        t = t # Time centroids can be negative (relative) or positive
+        gamma_t = F.softplus(gamma_t) # Must be positive
+        gamma_mu = F.softplus(gamma_mu) # Must be positive
+        
+        # 4. Decode Features (Normalize)
+        feat_flat = self.feature_head(concept_state)
+        mu = feat_flat.view(-1, 3, self.embed_dim)
+        mu = F.normalize(mu, dim=-1) # Ensure unit sphere
+        
+        return P, t, gamma_t, gamma_mu, mu
 
 
 
@@ -187,11 +227,3 @@ class EvidenceScorer(nn.Module):
 
         # return evidence scores for each concept
         return total_log_evidence - log_tau
-
-
-if __name__ == "__main__":
-    tester = LogitSanityTests()
-    tester.test_relational()
-    tester.test_temporal()
-    tester.test_aggregation_and_hill()
-    tester.run_full_pipeline()
