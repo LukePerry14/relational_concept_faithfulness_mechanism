@@ -2,8 +2,11 @@ import unittest
 import torch
 import math
 from dataclasses import dataclass
-from evidence_scoring_head import EvidenceScorer
+from evidence_scoring_head import EvidenceScorer, ConceptDecoder
 import numpy as np
+import torch.optim as optim
+import torch.nn.functional as F
+
 # Mock Concept Prototype Class
 @dataclass
 class MockPrototype:
@@ -146,5 +149,116 @@ class TestEvidenceScorer(unittest.TestCase):
         print(f"final Score Activation: {torch.sigmoid(torch.tensor(logit.item())).item()}")
         self.assertAlmostEqual(logit.item(), 0.0, delta=0.01)
 
-if __name__ == '__main__':
-    unittest.main(argv=[''], exit=False)
+
+def print_comparison(name, target, prediction, limit=3):
+    """
+    Prints target vs prediction side-by-side with error.
+    limit: max number of rows to print per tensor to keep output clean.
+    """
+    print(f"\n>> {name.upper()} COMPARISON:")
+    
+    # Flatten to list for easy iteration if dimensionality is high
+    # We just grab the first batch item for simplicity
+    t_flat = target[0].detach().numpy()
+    p_flat = prediction[0].detach().numpy()
+    
+    # Calculate Residual
+    error = abs(t_flat - p_flat)
+    
+    print(f"{'INDEX':<8} | {'TARGET':<25} | {'DECODED':<25} | {'ERROR':<10}")
+    print("-" * 75)
+    
+    # Iterate through first 'limit' items (e.g. first 3 hops)
+    for i in range(min(len(t_flat), limit)):
+        # Format array as string with 4 decimals
+        t_str = np.array2string(t_flat[i], formatter={'float_kind':lambda x: "%.4f" % x}, suppress_small=True)
+        p_str = np.array2string(p_flat[i], formatter={'float_kind':lambda x: "%.4f" % x}, suppress_small=True)
+        e_str = f"{np.mean(error[i]):.4f}" # Mean error for that row
+        
+        print(f"Hop {i:<4} | {t_str:<25} | {p_str:<25} | {e_str:<10}")
+    print("-" * 75)
+    
+    
+def test_basic_decoder_learning():
+    print("\n" + "="*40)
+    print(" STARTING DECODER OVERFITTING TEST ")
+    print("="*40)
+    
+    # 1. Hyperparameters
+    Z_DIM = 16
+    EMBED_DIM = 16  # Reduced for cleaner printing
+    MAX_HOPS = 3
+    RELATION_COUNT = 4 
+    LR = 0.01
+    STEPS = 500
+    
+    # 2. Initialize Model & Optimizer
+    decoder = ConceptDecoder(Z_DIM, EMBED_DIM, MAX_HOPS, RELATION_COUNT)
+    z_latent = torch.nn.Parameter(torch.randn(1, Z_DIM))
+    optimizer = optim.Adam(decoder.parameters(), lr=LR)
+    
+    # 3. Create "Ground Truth" Targets
+    target_rel = F.softmax(torch.randn(1, MAX_HOPS, RELATION_COUNT + 1), dim=-1)
+    target_time = torch.randn(1, MAX_HOPS)
+    target_gamma_t = torch.rand(1, MAX_HOPS) + 0.5 
+    target_gamma_f = torch.rand(1, MAX_HOPS) + 0.5
+    target_feat = F.normalize(torch.randn(1, MAX_HOPS, EMBED_DIM), dim=-1)
+    
+    print(f"Target Feature [0,0] (First val): {target_feat[0,0,0]:.4f}")
+    
+    # 4. Training Loop
+    import numpy as np # Import locally for the helper function
+    
+    for i in range(STEPS):
+        optimizer.zero_grad()
+        
+        # Forward Pass
+        P, t, g_t, g_f, mu = decoder(z_latent)
+        
+        # Compute Loss
+        loss_rel = F.mse_loss(P, target_rel)
+        loss_time = F.mse_loss(t, target_time)
+        loss_gammas = F.mse_loss(g_t, target_gamma_t) + F.mse_loss(g_f, target_gamma_f)
+        loss_feat = F.mse_loss(mu, target_feat)
+        
+        total_loss = loss_rel + loss_time + loss_gammas + loss_feat
+        
+        # Backward Pass
+        total_loss.backward()
+        optimizer.step()
+        
+        if i % 100 == 0:
+            print(f"Step {i:03}: Loss = {total_loss.item():.6f}")
+
+    # 5. Visual Evaluation
+    print("\n" + "="*40)
+    print(" FINAL RESULTS ")
+    print("="*40)
+    print(f"Final Total Loss: {total_loss.item():.6f}\n")
+    
+    # Use helper to print components
+    print_comparison("Relations (Probabilities)", target_rel, P)
+    
+    # Combine Gammas into one print for brevity
+    # Stack them: [Hop, 2] -> Col 0 is Time Gamma, Col 1 is Feat Gamma
+    # Need to unsqueeze last dim to stack
+    target_gammas = torch.stack((target_gamma_t, target_gamma_f), dim=2)
+    pred_gammas = torch.stack((g_t, g_f), dim=2)
+    print_comparison("Gammas [Time, Feat]", target_gammas, pred_gammas)
+    
+    # Time (Reshape for printer: [1, L] -> [1, L, 1])
+    print_comparison("Time Offsets", target_time.unsqueeze(-1), t.unsqueeze(-1))
+    
+    # Features (First 4 dims only to fit screen)
+    print_comparison("Node Features (First 4 dims)", target_feat[:, :, :4], mu[:, :, :4])
+
+    # 6. Success Check
+    if total_loss.item() < 0.05:
+        print("\n✅ SUCCESS: Decoder learned the target distribution.")
+    else:
+        print("\n❌ FAILURE: Decoder did not converge.")
+        
+        
+if __name__ == "__main__":
+    # unittest.main(argv=[''], exit=False)
+

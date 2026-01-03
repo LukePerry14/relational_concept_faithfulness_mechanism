@@ -2,59 +2,6 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch
 import math
-from dataclasses import dataclass
-import unittest
-
-class ConceptDecoder(nn.Module):
-    def __init__(self, z_dim, embed_dim, max_hops, max_relations):
-        super().__init__()
-
-        # maybe more sophisticated method of handling discrete path generation using MolGAN style generation?
-        # https://arxiv.org/abs/1805.11973
-
-        # At this point we look to optimise the embedding space directly, this will eventually be swapped out for a NN operating on the graph data
-        self.trunk = nn.Sequential(
-            nn.Linear(z_dim, z_dim * 4),
-            nn.GELU(),
-            nn.Linear(z_dim * 4, z_dim * 2)
-        )
-                
-        # Relation Head: Output [4, 3] (logits for softmax)
-        self.relation_head = nn.Linear(z_dim * 2, max_hops * max_relations+1)
-        
-        # Time/Gamma Head: Output [3] (mu), [3] (gamma_mu), [3] (gamma_t)
-        # Total size = 9
-        self.meta_head = nn.Linear(z_dim * 2, 9)
-        
-        # Feature Head: Output [3, D]
-        self.feature_head = nn.Linear(z_dim * 2, 3 * embed_dim)
-
-    def forward(self, z):
-        # 1. Expand Latent
-        concept_state = self.trunk(z)
-        
-        # 2. Decode Relations (Apply Softmax/Gumbel)
-        rel_flat = self.relation_head(concept_state)
-        # Reshape to [Batch, 4, 3] and apply Softmax on last dim
-        P = F.softmax(rel_flat.view(-1, 4, 3), dim=-1)
-        
-        # 3. Decode Meta (Time/Gammas) (Apply Softplus)
-        meta_flat = self.meta_head(concept_state)
-        # Split into components
-        t, gamma_t, gamma_mu = torch.split(meta_flat, 3, dim=1)
-        # Enforce constraints
-        t = t # Time centroids can be negative (relative) or positive
-        gamma_t = F.softplus(gamma_t) # Must be positive
-        gamma_mu = F.softplus(gamma_mu) # Must be positive
-        
-        # 4. Decode Features (Normalize)
-        feat_flat = self.feature_head(concept_state)
-        mu = feat_flat.view(-1, 3, self.embed_dim)
-        mu = F.normalize(mu, dim=-1) # Ensure unit sphere
-        
-        return P, t, gamma_t, gamma_mu, mu
-
-
 
 class PredictionHead(nn.Module):
     def __init__(self, number_of_concepts):
@@ -80,6 +27,131 @@ class PredictionHead(nn.Module):
         #    task_logit = Linear(evidence_logits)
         task_logit = None
         return task_logit, evidence_logits
+
+class QueryBasedConceptDecoder(nn.Module):
+    def __init__(self, z_dim, embed_dim, max_hops, relation_count):
+        super().__init__()
+        self.L = max_hops
+        self.D = embed_dim
+        
+        # 1. THE HOP QUERIES
+        # Learnable vectors that represent "Step 1", "Step 2", etc.
+        # Shape: [L, z_dim]
+        self.hop_queries = nn.Parameter(torch.randn(max_hops, z_dim))
+        
+        # 2. THE SHARED TRUNK (Contextualizer)
+        # Takes (z + query) and expands it
+        # Note: We process L items per concept, so this acts on the 'sequence' dim
+        self.trunk = nn.Sequential(
+            nn.Linear(z_dim, z_dim * 4),
+            nn.LayerNorm(z_dim * 4),
+            nn.GELU(),
+            nn.Linear(z_dim * 4, z_dim * 2) # Compress slightly before heads
+        )
+        
+        # 3. THE BRANCHES (Heads)
+        # These now operate on the "Hops" dimension
+        
+        # Feature Head: Projects back to embedding dimension
+        self.feat_head = nn.Linear(z_dim * 2, embed_dim)
+        
+        # Relation Head: Predicts relation leading TO this node
+        self.rel_head = nn.Linear(z_dim * 2, relation_count + 1)
+        
+        # Meta Head: Time and Gammas
+        self.meta_head = nn.Linear(z_dim * 2, 3) # t, gamma_t, gamma_mu
+
+    def forward(self, z):
+        """
+        z: [Batch_Size, z_dim] (The Concept Tokens)
+        """
+        batch_size = z.shape[0]
+        
+        # 1. Expand Z for each Hop
+        # z_expanded: [Batch, L, z_dim]
+        z_expanded = z.unsqueeze(1).repeat(1, self.L, 1)
+        
+        # 2. Add Hop Queries (Broadcasting)
+        # This injects the "Step Info" into the concept
+        # queries: [1, L, z_dim]
+        queries = self.hop_queries.unsqueeze(0)
+        query_state = z_expanded + queries 
+        
+        # 3. Pass through Trunk (Shared processing)
+        # [Batch, L, z_dim] -> [Batch, L, z_dim*2]
+        hidden_state = self.trunk(query_state)
+        
+        # 4. Decode Heads
+        
+        # Features: [Batch, L, D]
+        mu = F.normalize(self.feat_head(hidden_state), p=2, dim=-1)
+        
+        # Relations: [Batch, L, R]
+        rel_logits = self.rel_head(hidden_state)
+        P = F.softmax(rel_logits, dim=-1)
+        
+        # Meta: [Batch, L, 3]
+        meta = self.meta_head(hidden_state)
+        t = meta[:, :, 0]
+        gamma_t = F.softplus(meta[:, :, 1])
+        gamma_f = F.softplus(meta[:, :, 2])
+        
+        return P, t, gamma_t, gamma_f, mu
+
+class ConceptDecoder(nn.Module):
+    def __init__(self, z_dim, embed_dim, max_hops, relation_count):
+        super().__init__()
+
+        self.L = max_hops
+        self.R = relation_count + 1 # +1 for Null Relation
+        self.D = embed_dim
+        
+        # Shared Trunk
+        self.trunk = nn.Sequential(
+            nn.Linear(z_dim, z_dim * 4),
+            nn.GELU(),
+            nn.Linear(z_dim * 4, z_dim * 2)
+        )
+                
+        # Relation Head: Output [Batch, L * R]
+        self.relation_head = nn.Linear(z_dim * 2, self.L * self.R)
+        
+        # Meta Head: Output [Batch, L * 3] -> (Time, Gamma_T, Gamma_F)
+        self.meta_head = nn.Linear(z_dim * 2, self.L * 3)
+        
+        # Feature Head: Output [Batch, L * D]
+        self.feature_head = nn.Linear(z_dim * 2, self.L * self.D)
+
+    def forward(self, z):
+        batch_size = z.shape[0]
+        
+        # 1. Expand Latent
+        concept_state = self.trunk(z)
+        
+        # 2. Decode Relations
+        rel_flat = self.relation_head(concept_state)
+        # Reshape using self.L and self.R, not hardcoded 4 and 3
+        relation_matrix = F.softmax(rel_flat.view(batch_size, self.L, self.R), dim=-1)
+        
+        # 3. Decode Meta (Time & Gammas)
+        meta_flat = self.meta_head(concept_state)
+        
+        # Split logic: We have L*3 elements. We want 3 tensors of size L.
+        # So we split with section size = self.L
+        time, gamma_time, gamma_feat = torch.split(meta_flat, self.L, dim=1)
+        
+        # Enforce positivity
+        gamma_time = F.softplus(gamma_time)
+        gamma_feat = F.softplus(gamma_feat)
+        
+        # 4. Decode Features
+        feat_flat = self.feature_head(concept_state)
+        mu = feat_flat.view(batch_size, self.L, self.D)
+        
+        # Ensure unit sphere
+        mu = F.normalize(mu, dim=-1)
+        
+        return relation_matrix, time, gamma_time, gamma_feat, mu
 
 
 

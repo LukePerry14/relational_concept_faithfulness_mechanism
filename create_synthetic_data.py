@@ -1,3 +1,1 @@
-if __name__ == "__main__":
-    for noise in []:
-        pass
+from relbench.base import Database, Dataset, Table
