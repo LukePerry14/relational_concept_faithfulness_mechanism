@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Union, Sequence
 import numpy as np
 import pytest
 
-from faithfulness_poc import Schema, Concept, Subgraph
+from utils.faithfulness_poc import Schema, Concept, Subgraph
 
 # ============================================================
 # SECTION 1: Report utilities

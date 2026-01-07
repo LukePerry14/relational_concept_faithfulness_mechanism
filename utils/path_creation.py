@@ -1,4 +1,4 @@
-from custom_dataclasses import (
+from utils.custom_dataclasses import (
     Concept,
     MetaPath
     

@@ -28,7 +28,7 @@ from typing import List, Dict, Any
 import numpy as np
 import pytest
 
-from faithfulness_poc import Schema, Concept, Subgraph
+from utils.faithfulness_poc import Schema, Concept, Subgraph
 from testing_helpers import *
 
 

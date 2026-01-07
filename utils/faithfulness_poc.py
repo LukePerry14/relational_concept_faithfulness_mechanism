@@ -4,7 +4,7 @@ import numpy as np
 import networkx as nx
 import plotly.graph_objects as go
 from collections import deque
-from custom_dataclasses import *
+from utils.custom_dataclasses import *
 NodeId = int
 
 DEFAULT_TAU = 0.5
@@ -28,7 +28,7 @@ class Subgraph:
 
     # --- visualise ----
 
-    def visualize_subgraph_plotly(self,):
+    def visualize_subgraph_plotly(self):
         """
         Interactive Plotly visualisation of a Subgraph.
 
@@ -171,8 +171,8 @@ class Subgraph:
         self.MISSING_FEAT = np.asarray([float('inf')] * self.D)
         return root_id
 
+    # Inside faithfulness_poc.py -> Subgraph.add_evidence
     def add_evidence(self, metapaths):
-
         if self.root == None:
             raise Exception("Create the root first")
         
@@ -182,13 +182,14 @@ class Subgraph:
                 node_times = metapath.node_times
                 node_features = metapath.node_features
                 
-                if not (len(node_types) == len(node_times) == len(node_features)):
-                    raise Exception("Size mismatch")
-                
                 prev = self.nodes[self.root]
                 
                 for idx in range(len(node_types)):
-                    
+                    # --- ADD THIS CHECK ---
+                    if node_types[idx] == NULL_TOKEN:
+                        break # Stop adding physical nodes when we hit NULL
+                    # ----------------------
+
                     if node_types[idx] not in self.schema.transitions[prev.node_type]:
                         raise Exception(f"Invalid node type at hop {idx}")
                     
@@ -200,7 +201,6 @@ class Subgraph:
                     )]
                     
                     self._add_edge(prev.id, node.id, "NULL")
-                    
                     prev = node
             except Exception as e:
                 print(f"Failed on metapath {metapath} with {e}")

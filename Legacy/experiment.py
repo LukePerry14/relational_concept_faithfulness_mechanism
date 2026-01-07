@@ -8,11 +8,11 @@ import torch.nn as nn
 import numpy as np
 
 # Existing imports from your file
-from custom_dataclasses import Schema
-from faithfulness_poc import Subgraph
-from path_creation import *
+from utils.custom_dataclasses import Schema
+from utils.faithfulness_poc import Subgraph
+from utils.path_creation import *
 # New import for the differentiable components
-from torch_evidence_scoring import DifferentiableEvidenceScorer, prepare_batch
+from Legacy.torch_evidence_scoring import DifferentiableEvidenceScorer, prepare_batch
 
 import torch.nn.functional as F
 
