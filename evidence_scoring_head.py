@@ -16,15 +16,86 @@ class PredictionHead(nn.Module):
 
         # Interpretable combination of activation scores. What is an acceptable level of tradeoff in simplicity versus expressivity? 
         self.prediction_head = nn.Linear(params["num_concepts"], 2)
+        
 
+    def inspect_concepts(self, node_types):
+        """
+        Decodes and prints latent concepts, including the Root node features 
+        and subsequent Transition features/relations.
+        """
+        vocab = node_types + ["∅ (STOP)"]
+        
+        with torch.no_grad():
+            # 1. Decode latent vectors into physical parameters
+            rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p = self.concept_decoder(self.concepts)
+        
+        # Get class-1 (Fraud) weights for importance ranking
+        importance_weights = self.prediction_head.weight[1].detach().cpu()
+        
+        print(f"\n{'='*85}")
+        print(f"{'ID':<4} | {'Path Structure (Transitions)':<35} | {'Tau':<6} | {'Weight':<8}")
+        print(f"{'-'*85}")
+
+        for i in range(self.concepts.shape[0]):
+            # --- 1. Decode Relations (Transitions only) ---
+            path_indices = torch.argmax(rel_p[i], dim=-1) 
+            path_str = " -> ".join([vocab[idx] for idx in path_indices])
+            
+            tau_val = tau_p[i].item()
+            weight_val = importance_weights[i].item()
+            
+            print(f"{i:<4} | {path_str:<35} | {tau_val:.3f} | {weight_val:+.4f}")
+            
+            # --- 2. Decode Timing (Root + Transitions) ---
+            times = time_p[i].detach().cpu().numpy()
+            gammas_t = g_time_p[i].detach().cpu().numpy()
+            time_summary = " | ".join([f"Node{h}(t:{t:.1f}±{g:.1f})" for h, (t, g) in enumerate(zip(times, gammas_t))])
+            print(f"     └─ Timing: {time_summary}")
+
+            # --- 3. Decode Features (Root + Transitions) ---
+            feats = feat_p[i].detach().cpu().numpy()
+            gammas_f = g_feat_p[i].detach().cpu().numpy()
+            
+            # Format features for legibility: [x.x, y.y] (±g)
+            feat_list = []
+            for h in range(len(feats)):
+                label = "Root" if h == 0 else f"Hop{h}"
+                f_str = f"{label}:[{', '.join([f'{val:.2f}' for val in feats[h]])}] (±{gammas_f[h]:.2f})"
+                feat_list.append(f_str)
+            
+            print(f"     └─ Feats:  {' | '.join(feat_list)}")
+            
+        print(f"{'='*85}\n")
+        return rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p
     
+        
+    def concept_orthogonality_regularisation(self):
+        """
+        Ensures latent concepts are distinct by penalizing cosine similarity.
+        """
+        # Normalize latent vectors
+        z_norm = F.normalize(self.concepts, p=2, dim=1)
+        # Compute self-similarity matrix [num_concepts, num_concepts]
+        sim_matrix = torch.matmul(z_norm, z_norm.t())
+        
+        # Identity matrix (we don't penalize a concept matching itself)
+        identity = torch.eye(self.concepts.shape[0], device=self.concepts.device)
+        
+        # Penalize any off-diagonal similarity
+        loss = torch.mean((sim_matrix - identity) ** 2)
+        return loss
+
+
 
     def forward(self, sampled_metapaths):
         # Decode global concepts from latent z
         rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau = self.concept_decoder(self.concepts)
- 
+
+        
         # Calculate evidence mass over all concepts
         concept_activations = []
+        components_log = []
+        
         for i in range(self.concepts.shape[0]):
             # Extract the i-th decoded prototype
             prototype_object = type('Obj', (object,), {
@@ -35,20 +106,21 @@ class PredictionHead(nn.Module):
                 'gamma_features': gf_proto[i],
                 'tau': tau[i]
             })()
-            log_logit = self.evidence_scorer(prototype_object, sampled_metapaths)
+            log_logit, components = self.evidence_scorer(prototype_object, sampled_metapaths)
             concept_activations.append(log_logit)
+            components_log.append(components)
         
 
         # Task Prediction
         activation_tensor = torch.sigmoid(torch.stack(concept_activations)).t() # [num_concepts]
 
-        return self.prediction_head(activation_tensor)
+        return self.prediction_head(activation_tensor), components_log
 
 class ConceptDecoder(nn.Module):
     def __init__(self, concept_dim, feature_embed_dim, max_hops, relation_count):
         super().__init__()
 
-        self.L = max_hops
+        self.L = max_hops + 1
         self.R = relation_count + 1
         self.D = feature_embed_dim
         
@@ -62,6 +134,18 @@ class ConceptDecoder(nn.Module):
         self.relation_head = nn.Linear(concept_dim * 2, self.L * self.R)
         self.meta_head = nn.Linear(concept_dim * 2, (self.L * 3) + 1) # Handles (time, gamma_time, gamma_feat, tau)
         self.feature_head = nn.Linear(concept_dim * 2, self.L * self.D)
+        
+        
+        self.relation_head.apply(self._init_weights)
+        self.meta_head.apply(self._init_weights)
+        self.feature_head.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # Use a higher gain for the heads to ensure they vary with input
+            torch.nn.init.orthogonal_(m.weight, gain=2.0)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
 
     def forward(self, concept_z):
         batch_size = concept_z.shape[0]
@@ -74,15 +158,20 @@ class ConceptDecoder(nn.Module):
         
         # Decode time and gamma tensors
         meta_flat = self.meta_head(concept_state)
-        time, gamma_time, gamma_feat, tau_raw = torch.split(
+        time_raw, gamma_time, gamma_feat, tau_raw = torch.split(
             meta_flat, 
             [self.L, self.L, self.L, 1], 
             dim=1
         )
         
+        time = torch.cumsum(F.softplus(time_raw), dim=1)
+        
         # Enforce positivity on gammas
         gamma_time = F.softplus(gamma_time) # Ensure n divide by 0 error
-        gamma_feat = F.softplus(gamma_feat)
+        gamma_feat = F.sigmoid(gamma_feat)
+        
+        gamma_feat
+        
         tau = F.softplus(tau_raw)
         
         # Decode Features
@@ -124,7 +213,7 @@ class EvidenceScorer(nn.Module):
         """
         # Calculate Squared Difference between path encodings and prototype
         expanded_prototype = prototype_relations[None, None, :, :]
-        diff_sq = (expanded_prototype - batch_relations) ** 2 # TODO: Ensure data is unpacked correctly
+        diff_sq = (expanded_prototype - batch_relations) ** 2
         
         # Mean Squared Error per path as before
         mse = torch.mean(diff_sq, dim=(2, 3))  # [N]
@@ -257,7 +346,11 @@ class EvidenceScorer(nn.Module):
         log_tau = torch.log(concept_prototype.tau)
 
         # return evidence scores for each concept
-        return total_log_evidence - log_tau
+        return (total_log_evidence - log_tau), {
+            "rel": log_relational_similarity,
+            "time": log_temporal_similarity,
+            "feat": log_feature_similarity
+        }
     
 
 
