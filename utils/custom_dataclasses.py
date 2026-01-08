@@ -35,15 +35,17 @@ class Schema:
         hop_count is the size of the HOP NEIGHBOURHOOD (number of nodes in the metapath - 1)
         """
         cols = ordered_node_types + [NULL_TOKEN]
-        X = np.zeros((hop_count, len(cols)), dtype=float)
 
+        X = np.zeros((hop_count+1, len(cols)), dtype=float)
+        X[0][0] = 1
+        X[0][-1] = 1
         if zeroed:
             return X
         
         current = set()
         current.add(self.root_type)
         
-        for hop in range(hop_count):
+        for hop in range(1,hop_count+1):
             
             reachable_next = set()
             
@@ -61,6 +63,36 @@ class Schema:
 
 
         return X
+    
+    def get_adjacency_matrix(self, ordered_node_types):
+        """
+        Creates an (R+1) x (R+1) square matrix where A[i, j] = 1 
+        if node i can transition to node j.
+        """
+        nodes = ordered_node_types + [NULL_TOKEN]
+        R_plus_1 = len(nodes)
+        adj = np.zeros((R_plus_1, R_plus_1), dtype=float)
+
+        # Map types to indices for faster lookup
+        type_to_idx = {t: i for i, t in enumerate(nodes)}
+
+        for src, targets in self.transitions.items():
+            if src in type_to_idx:
+                src_idx = type_to_idx[src]
+                for dst in targets:
+                    if dst in type_to_idx:
+                        adj[src_idx, type_to_idx[dst]] = 1.0
+        
+        # STOP Logic: The null token can only transition to the null token
+        # This prevents the path from 'restarting' after a stop.
+        null_idx = type_to_idx[NULL_TOKEN]
+        adj[null_idx, null_idx] = 1.0
+        
+        # Every node should also be able to transition to STOP.
+        for i in range(R_plus_1):
+            adj[i, null_idx] = 1.0
+
+        return adj
 
 @dataclass
 class MetaPath:

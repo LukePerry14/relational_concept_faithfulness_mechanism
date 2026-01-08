@@ -10,6 +10,7 @@ from utils.faithfulness_poc import Subgraph
 from evidence_scoring_head import PredictionHead
 import random
 import torch.optim as optim
+from concept_dashboard import run_dashboard
 
 class SchemaDrivenGenerator:
     def __init__(self, schema, embed_dim):
@@ -238,6 +239,30 @@ def print_ground_truth(concept, node_types):
     print(f"Saturation Threshold (Tau): {concept.tau:.3f}")
     print(f"{'='*85}\n")
 
+
+def print_contribution_report(components_list, labels):
+    """
+    components_list: List of dicts from pHead forward pass
+    labels: Ground truth labels for the batch
+    """
+    # Focus only on True Positives to see if the motif is being caught
+    pos_mask = (labels == 1)
+    
+    print(f"\n{'-'*20} SIMILARITY BREAKDOWN (Positive Samples) {'-'*20}")
+    print(f"{'Concept':<10} | {'Relational':<12} | {'Temporal':<12} | {'Feature':<12}")
+    
+    for c_idx, comp in enumerate(components_list["components"]):
+        # comp['rel'] is [Batch, Path_Samples]
+        # We want the average log-similarity across all paths in positive subgraphs
+        rel_avg = np.exp(comp['rel'][pos_mask].mean().item())
+        time_avg = np.exp(comp['time'][pos_mask].mean().item())
+        feat_avg = np.exp(comp['feat'][pos_mask].mean().item())
+        
+        print(f"ID {c_idx:<7} | {rel_avg:>12.2f} | {time_avg:>12.2f} | {feat_avg:>12.2f}")
+    print(f"{'-'*75}")
+
+
+
 if __name__ == "__main__":
     params = {
         "concept_dim": 16,
@@ -246,10 +271,11 @@ if __name__ == "__main__":
         "K_test": 40,
         "node_types": ["customer", "review", "product"],
         "max_hops": 2,
-        "num_concepts": 3,
-        "num_epochs": 50, # single pass over data
+        "num_concepts": 1,
+        "num_epochs": 50,
         "batch_size": 10,
         "training_steps": 500,
+        "relational_sharpness": 10,
         "lr": 0.01
     }
     
@@ -259,6 +285,8 @@ if __name__ == "__main__":
     _, _, test_dataset = toy_amazon({**params, "K": params["K_test"]})  
 
     
+    params["schema"] = toy_amazon_schema
+
     pHead = PredictionHead(params)
 
 
@@ -287,10 +315,10 @@ if __name__ == "__main__":
 
         optimizer.zero_grad()
 
-        prediction_logits, _ = pHead(sampled_train)
+        prediction_logit, _ = pHead(sampled_train)
 
         # ortho_loss = pHead.concept_orthogonality_regularisation()
-        loss = F.cross_entropy(prediction_logits, batch_labels) #+ (1 * ortho_loss)
+        loss = F.binary_cross_entropy_with_logits(prediction_logit, batch_labels.float()) #+ (1 * ortho_loss)
     
         loss.backward()
         optimizer.step()
@@ -300,23 +328,26 @@ if __name__ == "__main__":
             pHead.eval()
             with torch.no_grad():
                 sampled_test = collate_metapaths(test_dataset.subgraphs, params["max_hops"], params["feature_embed_dim"], len(params["node_types"]))
-                test_logits, components = pHead(sampled_test)
+                test_logit, components = pHead(sampled_test)
                 
                 # Metrics
-                test_preds = torch.argmax(test_logits, dim=1)
+                test_preds = (test_logit > 0).long()
                 test_acc = (test_preds == test_labels).float().mean()
                 
-                preds = torch.argmax(prediction_logits, dim=1)
-                accuracy = (preds == batch_labels).float().mean()
+                train_preds = (prediction_logit > 0).long()
+                train_acc = (train_preds == batch_labels).float().mean()
+
+                print_contribution_report(components, test_labels)
                 
             pHead.train()
-            print(f"Step {i:03d} | Loss: {loss.item():.4f} | train Acc: {accuracy:.2f} | test Acc: {test_acc:.2f}")
+            print(f"Step {i:03d} | Loss: {loss.item():.4f} | train Acc: {train_acc:.2f} | test Acc: {test_acc:.2f}")
 
     print("\nTraining Complete.")
-    print(pHead.concepts.detach())
     print_ground_truth(target_concept, params["node_types"])
     
     pHead.inspect_concepts(params["node_types"])
+
+    # run_dashboard(pHead, params["node_types"])
     
 """
 TODO:

@@ -8,67 +8,68 @@ class PredictionHead(nn.Module):
     def __init__(self, params):
         super().__init__()
 
-        self.evidence_scorer = EvidenceScorer()
-        self.concept_decoder = ConceptDecoder(params["concept_dim"], params["feature_embed_dim"], max_hops=params["max_hops"], relation_count=len(params["node_types"]))
+        self.evidence_scorer = EvidenceScorer(relational_sharpness=params["relational_sharpness"])
+        self.concept_decoder = ConceptDecoder(params)#params["concept_dim"], params["feature_embed_dim"], max_hops=params["max_hops"], relation_count=len(params["node_types"]), schema = params["schema"])
 
         # Store concepts locally and optimise on them directly
         self.concepts = nn.Parameter(torch.randn(params["num_concepts"], params["concept_dim"]))
 
         # Interpretable combination of activation scores. What is an acceptable level of tradeoff in simplicity versus expressivity? 
         self.prediction_head = nn.Linear(params["num_concepts"], 2)
-        
+        self.concept_weights = nn.Parameter(torch.ones(params["num_concepts"]))
+        self.bias = nn.Parameter(torch.tensor([-1.0]))
+
 
     def inspect_concepts(self, node_types):
         """
-        Decodes and prints latent concepts, including the Root node features 
-        and subsequent Transition features/relations.
+        Summarizes concepts by zipping relations, times, and features into 
+        a vertical, readable path for each concept archetype.
         """
         vocab = node_types + ["∅ (STOP)"]
         
         with torch.no_grad():
-            # 1. Decode latent vectors into physical parameters
             rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p = self.concept_decoder(self.concepts)
         
-        # Get class-1 (Fraud) weights for importance ranking
-        importance_weights = self.prediction_head.weight[1].detach().cpu()
+        # Calculate non-negative weights from the additive head [cite: 328]
+        positive_weights = torch.nn.functional.softplus(self.concept_weights).detach().cpu()
         
-        print(f"\n{'='*85}")
-        print(f"{'ID':<4} | {'Path Structure (Transitions)':<35} | {'Tau':<6} | {'Weight':<8}")
-        print(f"{'-'*85}")
+        print(f"\n{'='*100}")
+        print(f"{'ID':<4} | {'Tau (Saturation)':<18} | {'Prediction Weight':<18}")
+        print(f"{'='*100}")
 
         for i in range(self.concepts.shape[0]):
-            # --- 1. Decode Relations (Transitions only) ---
-            path_indices = torch.argmax(rel_p[i], dim=-1) 
-            path_str = " -> ".join([vocab[idx] for idx in path_indices])
-            
             tau_val = tau_p[i].item()
-            weight_val = importance_weights[i].item()
+            weight_val = positive_weights[i].item()
             
-            print(f"{i:<4} | {path_str:<35} | {tau_val:.3f} | {weight_val:+.4f}")
-            
-            # --- 2. Decode Timing (Root + Transitions) ---
-            times = time_p[i].detach().cpu().numpy()
-            gammas_t = g_time_p[i].detach().cpu().numpy()
-            time_summary = " | ".join([f"Node{h}(t:{t:.1f}±{g:.1f})" for h, (t, g) in enumerate(zip(times, gammas_t))])
-            print(f"     └─ Timing: {time_summary}")
+            print(f"{i:<4} | {tau_val:<18.3f} | {weight_val:<+18.4f}")
+            print(f"{'-'*100}")
+            print(f"{'Step':<10} | {'Node Type Distribution':<35} | {'Time (±γ)':<15} | {'Features (±γ)':<20}")
+            print(f"{'-'*100}")
 
-            # --- 3. Decode Features (Root + Transitions) ---
-            feats = feat_p[i].detach().cpu().numpy()
-            gammas_f = g_feat_p[i].detach().cpu().numpy()
-            
-            # Format features for legibility: [x.x, y.y] (±g)
-            feat_list = []
-            for h in range(len(feats)):
-                label = "Root" if h == 0 else f"Hop{h}"
-                f_str = f"{label}:[{', '.join([f'{val:.2f}' for val in feats[h]])}] (±{gammas_f[h]:.2f})"
-                feat_list.append(f_str)
-            
-            print(f"     └─ Feats:  {' | '.join(feat_list)}")
-            
-        print(f"{'='*85}\n")
-        return rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p
-    
+            # Iterate through the hops (L) to pair data together 
+            for h in range(rel_p.shape[1]):
+                # 1. Format Node Type Probs [cite: 49, 53]
+                probs = rel_p[i, h]
+                active_idx = torch.where(probs > 0.01)[0]
+                type_str = ", ".join([f"{vocab[idx]}({probs[idx]:.2f})" for idx in active_idx])
+                
+                # 2. Format Time [cite: 67, 71]
+                t_val = time_p[i, h].item()
+                t_gam = g_time_p[i, h].item()
+                time_str = f"{t_val:>4.1f} (±{t_gam:<4.1f})"
+                
+                # 3. Format Features [cite: 74, 75]
+                f_vec = feat_p[i, h].detach().cpu().numpy()
+                f_gam = g_feat_p[i, h].item()
+                f_str = f"[{', '.join([f'{v:+.2f}' for v in f_vec])}] (±{f_gam:.2f})"
+                
+                step_label = "ROOT" if h == 0 else f"HOP {h}"
+                print(f"{step_label:<10} | {type_str:<35} | {time_str:<15} | {f_str}")
+
+            print(f"{'='*100}\n")
         
+        return rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p
+
     def concept_orthogonality_regularisation(self):
         """
         Ensures latent concepts are distinct by penalizing cosine similarity.
@@ -85,13 +86,14 @@ class PredictionHead(nn.Module):
         loss = torch.mean((sim_matrix - identity) ** 2)
         return loss
 
+    def interpretable_forward_pass(self, sampled_metapaths):
+        logits, pred_data = self.forward(sampled_metapaths)
 
 
     def forward(self, sampled_metapaths):
         # Decode global concepts from latent z
         rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau = self.concept_decoder(self.concepts)
 
-        
         # Calculate evidence mass over all concepts
         concept_activations = []
         components_log = []
@@ -107,23 +109,40 @@ class PredictionHead(nn.Module):
                 'tau': tau[i]
             })()
             log_logit, components = self.evidence_scorer(prototype_object, sampled_metapaths)
-            concept_activations.append(log_logit)
+
+            activation = torch.sigmoid(log_logit)
+            concept_activations.append(activation)
+            # concept_activations.append(log_logit)
+
             components_log.append(components)
         
 
         # Task Prediction
-        activation_tensor = torch.sigmoid(torch.stack(concept_activations)).t() # [num_concepts]
+        # activation_tensor = torch.sigmoid(torch.stack(concept_activations)).t() # [num_concepts]
+        activation_tensor = torch.stack(concept_activations).t()
 
-        return self.prediction_head(activation_tensor), components_log
+        weights = F.softplus(self.concept_weights)
+
+        pred_logit = (activation_tensor * weights).sum(dim=1) + self.bias
+
+        return pred_logit, {"components": components_log, "activations": activation_tensor}
 
 class ConceptDecoder(nn.Module):
-    def __init__(self, concept_dim, feature_embed_dim, max_hops, relation_count):
+    def __init__(self, params):#concept_dim, feature_embed_dim, max_hops, relation_count, schema):
         super().__init__()
+        concept_dim = params["concept_dim"]
+        feature_embed_dim = params["feature_embed_dim"]
+        max_hops = params["max_hops"]
+        relation_count = len(params["node_types"])
+        schema = params["schema"]
 
         self.L = max_hops + 1
         self.R = relation_count + 1
         self.D = feature_embed_dim
-        
+
+        self.reachability_mask = torch.from_numpy(schema.reachability_mask(hop_count = params["max_hops"], ordered_node_types = params["node_types"]))
+        self.adj = torch.from_numpy(schema.get_adjacency_matrix(ordered_node_types = params["node_types"])).float()
+
         # Shared Trunk
         self.trunk = nn.Sequential(
             nn.Linear(concept_dim, concept_dim * 4),
@@ -150,12 +169,35 @@ class ConceptDecoder(nn.Module):
     def forward(self, concept_z):
         batch_size = concept_z.shape[0]
         
+        # Viterbi algorithm
+
         concept_state = self.trunk(concept_z)
         
         # Decode Relations
-        rel_flat = self.relation_head(concept_state)
-        relation_matrix = F.softmax(rel_flat.view(batch_size, self.L, self.R), dim=-1)
+        rel_logits = self.relation_head(concept_state).view(batch_size, self.L, self.R)
+
+        adj = self.adj.to(concept_z.device)
+
+        relation_probs = []
+        # Step 1: Root is fixed (e.g., Customer)
+        curr_prob = torch.zeros(batch_size, self.R).to(concept_z.device)
+        curr_prob[:, 0] = 1.0 # Index 0 is Root/Customer
+        relation_probs.append(curr_prob)
         
+        # Sequential Masking
+        for l in range(1, self.L):
+            # Calculate reachability based on previous hop: [Batch, R] @ [R, R]
+            reachable = torch.matmul(curr_prob, adj) 
+            
+            # Use reachability mask to ensure logit mass isn't applied to unreachable nodes
+            hop_logits = rel_logits[:, l, :]
+            masked_logits = hop_logits.masked_fill(reachable == 0, -1e9)
+            
+            curr_prob = F.softmax(masked_logits, dim=-1)
+            relation_probs.append(curr_prob)
+            
+        relation_matrix = torch.stack(relation_probs, dim=1)
+
         # Decode time and gamma tensors
         meta_flat = self.meta_head(concept_state)
         time_raw, gamma_time, gamma_feat, tau_raw = torch.split(
@@ -164,15 +206,18 @@ class ConceptDecoder(nn.Module):
             dim=1
         )
         
-        time = torch.cumsum(F.softplus(time_raw), dim=1)
+        # time = torch.cumsum(F.softplus(time_raw), dim=1)
+        # Treat time_raw as a the exponent in an exponentiation, allowing us to handle varying scales better and increase convergence time
+        time_deltas = torch.exp(time_raw) 
+        time = torch.cumsum(time_deltas, dim=1)
         
         # Enforce positivity on gammas
-        gamma_time = F.softplus(gamma_time) # Ensure n divide by 0 error
-        gamma_feat = F.sigmoid(gamma_feat)
+        # make gamma_time exist in the same logspace for stability under different temporal resolutions
+        gamma_time = torch.exp(gamma_time)
+        gamma_feat = F.softplus(gamma_feat)
         
-        gamma_feat
         
-        tau = F.softplus(tau_raw)
+        tau = F.softplus(tau_raw) + 0.1 # minimum tau requirement
         
         # Decode Features
         feat_flat = self.feature_head(concept_state)
@@ -182,8 +227,6 @@ class ConceptDecoder(nn.Module):
         mu = F.normalize(mu, dim=-1)
         
         return relation_matrix, time, gamma_time, gamma_feat, mu, tau
-
-
 
 class EvidenceScorer(nn.Module):
     def __init__(self, relational_sharpness = 10, k=0.1):
@@ -241,69 +284,66 @@ class EvidenceScorer(nn.Module):
         mask = torch.isfinite(batch_times)
         # diff = torch.where(mask, prototype_time - batch_times, torch.zeros_like(batch_times))
         
-        prototype_time_expanded = prototype_time[None, None, :]
-        gamma_time_expanded = gamma_time[None, None, :]
-        diff = prototype_time_expanded - batch_times
+        # Convert inputs to logspacefor gradient stability
+        log_proto = torch.log(prototype_time[None, None, :] + 1.0)
+        log_batch = torch.log(batch_times + 1.0)
 
-        masked_diffs = torch.where(mask, diff, torch.zeros_like(diff))
-
-        # Normalized Squared Difference - add epsilon for divide by zero ?
-        normalized_diff_sq = (masked_diffs ** 2) / ((gamma_time_expanded ** 2) + self.EPS)
+        log_gamma_time = torch.log(gamma_time[None, None, :] + self.EPS)
         
-        # Sum over path length - can be of arbitrary size
-        total_diff = torch.sum(normalized_diff_sq, dim=2)
+        # 3. Calculate Difference in Log-Space
+        log_diff = log_proto - log_batch
+        masked_diff = torch.where(mask, log_diff, torch.zeros_like(log_diff))
         
-        # Return Log Similarity
-        log_similarity = self.ln_k * total_diff
+        # 4. Normalize Difference by the Effective Log-Window
+        # If diff is inside the window, ratio < 1.0. If outside, ratio > 1.0.
+        ratio = masked_diff / log_gamma_time
         
-        return log_similarity # Range: (-inf, 0]
+        # 5. Square and Clamp
+        # We use the same robust penalty logic as before
+        dist_sq = ratio ** 2
+        clamped_penalty = F.softsign(dist_sq) #* 10.0
+        
+        total_path_penalty = torch.sum(clamped_penalty, dim=-1)
+        
+        return self.ln_k * total_path_penalty
 
     def _feature_similarity_log(self, prototype_features, gamma_features, batch_features):
-        """
-        Computes Log-Similarity for features with padding mask.
-        batch_features shape: [B, P, L, D]
-        """
-        # 1. Create the Boolean Mask
-        # Check if the feature vector at each hop is finite.
-        # Resulting shape: [B, P, L]
-        mask = torch.isfinite(batch_features).all(dim=-1)
+            """
+            Calculates Log-Similarity for features following the reparameterized RBF kernel.
+            Returns: [Batch, Path_Count]
+            """
+            # Create mask for padded data [subgraphs, paths, path_length]
+            mask = torch.isfinite(batch_features).all(dim=-1)
 
-        # 2. Prevent Normalization NaNs
-        # F.normalize will produce NaN if it encounters 'inf'. We replace 'inf' 
-        # with 0.0 only for the normalization step.
-        safe_batch_features = torch.where(mask.unsqueeze(-1), batch_features, torch.zeros_like(batch_features))
+            # Convert embeddings to unit vectors for cosine
+            prototype_norm = F.normalize(prototype_features, p=2, dim=-1, eps=self.EPS).unsqueeze(0).unsqueeze(0)
+            
+            safe_batch_features = torch.where(mask.unsqueeze(-1), batch_features, torch.zeros_like(batch_features))
+            batch_norm = F.normalize(safe_batch_features, p=2, dim=-1, eps=self.EPS)
 
-        # 3. Normalize prototype and batch embeddings
-        # prototype_features: [L, D] -> [1, 1, L, D]
-        # batch_features: [B, P, L, D]
-        prototype_norm = F.normalize(prototype_features, p=2, dim=-1, eps=self.EPS)
-        batch_norm = F.normalize(safe_batch_features, p=2, dim=-1, eps=self.EPS)
+            # Compute Cosine Similarity: [subgraphs, paths, path_length]
+            cosine_similarity = torch.sum(batch_norm * prototype_norm, dim=-1)
 
-        # 4. Compute Cosine Similarity
-        # Sum across the D dimension (dim=-1)
-        # Resulting shape: [B, P, L]
-        cosine_similarity = torch.sum(batch_norm * prototype_norm[None, None, :, :], dim=-1)
+            # Convert to Distance: [-1, 1] -> [0, 1] (lower is closer)
+            similarity_distance = 1.0 - ((cosine_similarity + 1.0) / 2.0)
 
-        # 5. Convert Similarity to Distance
-        # Similarity range [-1, 1] -> Distance range [0, 1]
-        similarity_distance = 1.0 - ((cosine_similarity + 1.0) / 2.0)
+            # Apply Gamma Scaling using gamma reparameterisation
+            gamma_features_expanded = gamma_features[None, None, :] + self.EPS
 
-        # 6. Apply Gamma Scaling
-        # gamma_features shape: [L] -> [1, 1, L]
-        gamma_features_expanded = gamma_features[None, None, :]
-        gamma_modified_distance = similarity_distance / (gamma_features_expanded + self.EPS)
+            # Clamp similarity ratio to prevent huge distances from exploding gradients
+            similarity_ratio = similarity_distance / gamma_features_expanded
+            # clamped_similarity_ratio = torch.clamp(similarity_ratio, max=50)
+            clamped_similarity_ratio = F.softsign(similarity_ratio)
+            norm_dist_sq = (clamped_similarity_ratio) ** 2
 
-        # 7. Apply the Mask to Distances
-        # We explicitly zero out the distance for padding hops so they 
-        # contribute nothing to the sum.
-        final_distance_sq = torch.where(mask, gamma_modified_distance ** 2, torch.zeros_like(gamma_modified_distance))
+            # reapply mask to ensure null nodes don't generate signal
+            final_penalty = torch.where(mask, norm_dist_sq, torch.zeros_like(norm_dist_sq))
 
-        # 8. Sum over path length (L) and convert to Log Similarity
-        # Resulting shape: [B, P]
-        total_dist = torch.sum(final_distance_sq, dim=-1)
-        log_similarity = self.ln_k * total_dist
+            # Sum penalty over nodes to create penalty for full path [subgraphs, paths, path_length] -> [subgraphs, paths]
+            total_path_penalty = torch.sum(final_penalty, dim=-1)
 
-        return log_similarity
+            # Return Log-Similarity for EACH path
+            return self.ln_k * total_path_penalty
 
     def aggregate_evidence_log(self, log_s_rel, log_s_time, log_s_feat):
         # Combine log similarities (Multiplication becomes Addition)
