@@ -311,7 +311,7 @@ def run_temporal_unit_test():
         
         # Penalize temporal window relative to temporal scale
         relative_gamma = gt_p / (t_p.detach() + 1.0) 
-        gamma_t_reg = 0.05 * relative_gamma.mean()
+        gamma_t_reg = 0.5 * relative_gamma.mean()
         
         loss = task_loss + gamma_t_reg
         loss.backward()

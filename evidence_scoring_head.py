@@ -208,8 +208,9 @@ class ConceptDecoder(nn.Module):
         
         # time = torch.cumsum(F.softplus(time_raw), dim=1)
         # Treat time_raw as a the exponent in an exponentiation, allowing us to handle varying scales better and increase convergence time
-        time_deltas = torch.exp(time_raw) 
-        time = torch.cumsum(time_deltas, dim=1)
+        log_increments = F.softplus(time_raw)
+        log_time_trajectory = torch.cumsum(log_increments, dim=1)
+        time = torch.exp(log_time_trajectory) - 1.0
         
         # Enforce positivity on gammas
         # make gamma_time exist in the same logspace for stability under different temporal resolutions
@@ -264,49 +265,62 @@ class EvidenceScorer(nn.Module):
         log_similarity = - 1 * self.relational_sharpness * mse 
         
         return log_similarity  # Range: (-inf, 0]
-
+    
+    
     def _time_similarity_log(self, prototype_time, gamma_time, batch_times):
         """
-        Computes Log-Similarity for time.
-        Formula: ln(0.1) * sum(normalized_diff)
-
-        Parameter sizes:
-        prototype_time = [L]
-        gamma_time = [L]
-        batch_relations = [L x B]
-
-        where:
-            - L is max metapath length
-            - B is the batch size
-        """
-
-        # Ensure gamma
-        mask = torch.isfinite(batch_times)
-        # diff = torch.where(mask, prototype_time - batch_times, torch.zeros_like(batch_times))
+        Computes Log-Similarity using Piecewise Logic to prevent Gradient Explosion.
         
-        # Convert inputs to logspacefor gradient stability
+        Mechanism:
+        1. Inside Window (diff < width): Standard RBF (Quadratic).
+           - Gradient scales with 1/gamma (Sensitivity increases as precision increases).
+        2. Outside Window (diff > width): Linear Tail (Subtraction).
+           - Gradient is CONSTANT (1.0 * Scale).
+           - Crucially: Gradient is INDEPENDENT of Gamma. This prevents explosion.
+        """
+        mask = torch.isfinite(batch_times)
+        
+        # 1. Log-Space Conversion
         log_proto = torch.log(prototype_time[None, None, :] + 1.0)
         log_batch = torch.log(batch_times + 1.0)
-
-        log_gamma_time = torch.log(gamma_time[None, None, :] + self.EPS)
         
-        # 3. Calculate Difference in Log-Space
-        log_diff = log_proto - log_batch
+        # 2. Effective Log-Width (The Window Size)
+        gamma_expanded = gamma_time[None, None, :] + self.EPS
+        log_upper = torch.log(prototype_time[None, None, :] + gamma_expanded + 1.0)
+        effective_log_width = log_upper - log_proto
+        
+        # 3. Log-Difference (Absolute Error)
+        log_diff = torch.abs(log_proto - log_batch)
         masked_diff = torch.where(mask, log_diff, torch.zeros_like(log_diff))
         
-        # 4. Normalize Difference by the Effective Log-Window
-        # If diff is inside the window, ratio < 1.0. If outside, ratio > 1.0.
-        ratio = masked_diff / log_gamma_time
+        # 4. PIECEWISE PENALTY
+        # We calculate BOTH penalties and select based on the region.
         
-        # 5. Square and Clamp
-        # We use the same robust penalty logic as before
-        dist_sq = ratio ** 2
-        clamped_penalty = F.softsign(dist_sq) #* 10.0
+        # Region A: RBF (Quadratic)
+        # Used when we are inside the tolerance window.
+        # Scaled so that at boundary (diff=width), penalty = -ln(k)
+        # Note: We enforce a minimum width in the denominator to prevent div/0 inside the bucket.
+        safe_width = torch.clamp(effective_log_width, min=1e-5)
+        rbf_penalty = (-self.ln_k) * (masked_diff / safe_width) ** 2
         
-        total_path_penalty = torch.sum(clamped_penalty, dim=-1)
+        # Region B: Linear Tail (Your Formulation)
+        # Used when we are outside the tolerance window.
+        # Penalty = Max_RBF_Penalty + (Excess_Distance * Slope)
+        # Slope = 10.0 ensures a strong pull even when far away.
+        linear_slope = 1 #10.0
+        excess_distance = masked_diff - safe_width
+        linear_penalty = (-self.ln_k) + (excess_distance * linear_slope)
         
-        return self.ln_k * total_path_penalty
-
+        # 5. Selection
+        final_penalty = torch.where(
+            masked_diff <= safe_width,
+            rbf_penalty,
+            linear_penalty
+        )
+        
+        # Return Log-Similarity (Negative Penalty)
+        return -1.0 * torch.sum(final_penalty, dim=-1)
+    
     def _feature_similarity_log(self, prototype_features, gamma_features, batch_features):
             """
             Calculates Log-Similarity for features following the reparameterized RBF kernel.
