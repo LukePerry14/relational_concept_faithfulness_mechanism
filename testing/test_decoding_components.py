@@ -252,7 +252,9 @@ def run_temporal_unit_test():
     
     params = {
         "concept_dim": 16, "feature_embed_dim": 2, "max_hops": 2,
-        "node_types": node_types, "schema": schema, "num_concepts": 1
+        "node_types": node_types, "schema": schema, "num_concepts": 1,
+        "gamma_floor": 0.1,
+        "min_tau": 0.1
     }
     
     decoder = ConceptDecoder(params)
@@ -288,13 +290,12 @@ def run_temporal_unit_test():
         # C. Construct Temporal Samples
         # Positive: Matches target [0, 10, 20]
         pos_times = target_times.view(1, 1, 3)
-        # Negative: Matches distractor [0, 50, 100]
         neg_times = dist_times.view(1, 1, 3)
         
         pos_sample = { 'relations': perfect_rels, 'times': pos_times, 'features': perfect_feats }
         neg_sample = { 'relations': perfect_rels, 'times': neg_times, 'features': perfect_feats }
 
-        # D. Score
+        # Scores
         proto_obj = type('Obj', (object,), {
             'relations': rel_p[0], 'times': t_p[0], 'gamma_times': gt_p[0],
             'features': mu_p[0], 'gamma_features': gf_p[0], 'tau': tau[0]
@@ -303,18 +304,36 @@ def run_temporal_unit_test():
         pos_logit, _ = scorer(proto_obj, pos_sample)
         neg_logit, _ = scorer(proto_obj, neg_sample)
         
-        # E. Loss with Gamma Regularization
+        # Task Loss
         task_loss = F.binary_cross_entropy_with_logits(
             torch.stack([pos_logit, neg_logit]).squeeze(), 
             torch.tensor([1.0, 0.0])
         )
+
+        excess_gamma = F.relu(gt_p - params["gamma_floor"]).mean()
+
+        # gamma_reg = F.softplus(torch.log(excess_gamma / task_loss))
+        # gamma_reg = 0
         
-        # Penalize temporal window relative to temporal scale
-        relative_gamma = gt_p / (t_p.detach() + 1.0) 
-        gamma_t_reg = 0.5 * relative_gamma.mean()
+        gamma_reg = 0.1 * gt_p.mean()
+        # gamma_reg = F.relu(F.softplus(torch.log(gt_p).mean()))
         
-        loss = task_loss + gamma_t_reg
+        # ceiling = task_loss.detach() + 0.1
+        # gamma_reg = raw_gamma_penalty * (ceiling / (ceiling + raw_gamma_penalty))
+
+        # excess_gamma = F.relu(gt_p - params["gamma_floor"]).mean()
+        # reg_weight = torch.exp(-task_loss.detach())
+
+        # gamma_reg = (reg_weight * excess_gamma).mean()
+
+        # Temporal Causality loss (ignore for now)
+        causal_reg = 0 # 1.0 * causality_regularization(t_p)
+        # gamma_reg = F.softplus()
+        loss = task_loss + gamma_reg + causal_reg
         loss.backward()
+
+        torch.nn.utils.clip_grad_norm_([concept_z], max_norm=1.0)
+
         optimizer.step()
         
         if step % 100 == 0:
@@ -326,7 +345,7 @@ def run_temporal_unit_test():
             diff_h1 = abs(learned_t[1] - target_times[1].item())
             diff_h2 = abs(learned_t[2] - target_times[2].item())
             
-            print(f"Step {step:03d} | Loss: {task_loss.item():.4f} | "
+            print(f"Step {step:03d} | Task_loss: {task_loss.item():.4f}, Gamma_loss = {gamma_reg:.4f}  | "
                     f"root: t={learned_t[0]:.1f}(diff:{diff_h0:.2f}, g:{learned_g[0]:.2f}) | "
                   f"H1: t={learned_t[1]:.1f}(diff:{diff_h1:.2f}, g:{learned_g[1]:.2f}) | "
                   f"H2: t={learned_t[2]:.1f}(diff:{diff_h2:.2f}, g:{learned_g[2]:.2f})")

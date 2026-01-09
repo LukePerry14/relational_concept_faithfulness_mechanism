@@ -265,7 +265,7 @@ def print_contribution_report(components_list, labels):
 
 if __name__ == "__main__":
     params = {
-        "concept_dim": 16,
+        "concept_dim": 6,
         "feature_embed_dim":2,
         "K_train": 100,
         "K_test": 40,
@@ -276,7 +276,10 @@ if __name__ == "__main__":
         "batch_size": 10,
         "training_steps": 500,
         "relational_sharpness": 10,
-        "lr": 0.01
+        "lr": 0.005,
+        "gamma_floor": 0.1,
+        "min_tau": 0.1,
+
     }
     
 

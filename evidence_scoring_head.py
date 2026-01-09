@@ -135,6 +135,9 @@ class ConceptDecoder(nn.Module):
         max_hops = params["max_hops"]
         relation_count = len(params["node_types"])
         schema = params["schema"]
+        
+        self.gamma_floor = params["gamma_floor"]
+        self.min_tau = params["min_tau"]
 
         self.L = max_hops + 1
         self.R = relation_count + 1
@@ -208,17 +211,15 @@ class ConceptDecoder(nn.Module):
         
         # time = torch.cumsum(F.softplus(time_raw), dim=1)
         # Treat time_raw as a the exponent in an exponentiation, allowing us to handle varying scales better and increase convergence time
-        log_increments = F.softplus(time_raw)
-        log_time_trajectory = torch.cumsum(log_increments, dim=1)
-        time = torch.exp(log_time_trajectory) - 1.0
+        time = torch.exp(time_raw)
         
         # Enforce positivity on gammas
         # make gamma_time exist in the same logspace for stability under different temporal resolutions
-        gamma_time = torch.exp(gamma_time)
+        gamma_time = torch.exp(gamma_time) + self.gamma_floor
         gamma_feat = F.softplus(gamma_feat)
         
         
-        tau = F.softplus(tau_raw) + 0.1 # minimum tau requirement
+        tau = F.softplus(tau_raw) + self.min_tau # minimum tau requirement
         
         # Decode Features
         feat_flat = self.feature_head(concept_state)
@@ -266,17 +267,54 @@ class EvidenceScorer(nn.Module):
         
         return log_similarity  # Range: (-inf, 0]
     
-    
     def _time_similarity_log(self, prototype_time, gamma_time, batch_times):
         """
-        Computes Log-Similarity using Piecewise Logic to prevent Gradient Explosion.
+        Computes Box-Distance in Log-Space with Huber Centering.
+        Prevents evidence vanishing for large distances.
+        """
+        # 1. Masking & Input Sanitization
+        mask = torch.isfinite(batch_times)
+        safe_batch_times = torch.where(mask, batch_times, torch.zeros_like(batch_times))
+
+        # 2. Log-Space Conversion
+        log_proto = torch.log(prototype_time + 1.0)
+        log_batch = torch.log(safe_batch_times + 1.0)
+        log_width = torch.log(gamma_time + 1.0)
         
-        Mechanism:
-        1. Inside Window (diff < width): Standard RBF (Quadratic).
-           - Gradient scales with 1/gamma (Sensitivity increases as precision increases).
-        2. Outside Window (diff > width): Linear Tail (Subtraction).
-           - Gradient is CONSTANT (1.0 * Scale).
-           - Crucially: Gradient is INDEPENDENT of Gamma. This prevents explosion.
+        # 3. Box Boundaries
+        box_min = log_proto - log_width
+        box_max = log_proto + log_width
+        
+        # 4. Box Distance (L1)
+        closest_point = torch.max(box_min, torch.min(log_batch, box_max))
+        dist_to_box = torch.abs(log_batch - closest_point)
+        
+        # 5. Huber Center Alignment [The Fix]
+        # Quadratic when error < 1.0 (Log-Scale), Linear when error > 1.0.
+        # This caps the penalty growth, keeping the Time Evidence "alive" 
+        # (e.g., -15 instead of -168) so the model attends to it.
+        dist_to_center = torch.abs(log_batch - log_proto)
+        
+        # We use a weight of 5.0 to balance with Feature/Relation scales
+        center_pull = 5.0 * torch.where(
+            dist_to_center < 1.0,
+            dist_to_center ** 2,       # Quadratic (Precision)
+            (2.0 * dist_to_center) - 1.0 # Linear (Robustness) - matched derivative at 1.0
+        )
+        
+        # Combine
+        total_log_dist = dist_to_box + center_pull
+        
+        # 6. Re-Apply Mask & Aggregate
+        final_dist = torch.where(mask, total_log_dist, torch.zeros_like(total_log_dist))
+        path_dist = torch.sum(final_dist, dim=-1)
+        
+        return self.ln_k * path_dist
+
+    def _time_similarity_log_RBF(self, prototype_time, gamma_time, batch_times):
+        """
+        Computes Log-Similarity with Gradient Safety Guards.
+        Prevents explosion when gamma approaches zero.
         """
         mask = torch.isfinite(batch_times)
         
@@ -284,41 +322,29 @@ class EvidenceScorer(nn.Module):
         log_proto = torch.log(prototype_time[None, None, :] + 1.0)
         log_batch = torch.log(batch_times + 1.0)
         
-        # 2. Effective Log-Width (The Window Size)
+        # Convert linear space gamma to logspace gamma
         gamma_expanded = gamma_time[None, None, :] + self.EPS
         log_upper = torch.log(prototype_time[None, None, :] + gamma_expanded + 1.0)
-        effective_log_width = log_upper - log_proto
-        
-        # 3. Log-Difference (Absolute Error)
+        log_width = log_upper - log_proto
+                
+        # Log-Difference
         log_diff = torch.abs(log_proto - log_batch)
         masked_diff = torch.where(mask, log_diff, torch.zeros_like(log_diff))
+                
+        # Region A: Inside Safe Window
+        rbf_penalty = (-self.ln_k) * (masked_diff / log_width) ** 2
         
-        # 4. PIECEWISE PENALTY
-        # We calculate BOTH penalties and select based on the region.
+        # Region B: Linear Tail
+        linear_slope = 10.0 
+        excess_dist = masked_diff - log_width
+        linear_penalty = (-self.ln_k) + (excess_dist * linear_slope)
         
-        # Region A: RBF (Quadratic)
-        # Used when we are inside the tolerance window.
-        # Scaled so that at boundary (diff=width), penalty = -ln(k)
-        # Note: We enforce a minimum width in the denominator to prevent div/0 inside the bucket.
-        safe_width = torch.clamp(effective_log_width, min=1e-5)
-        rbf_penalty = (-self.ln_k) * (masked_diff / safe_width) ** 2
-        
-        # Region B: Linear Tail (Your Formulation)
-        # Used when we are outside the tolerance window.
-        # Penalty = Max_RBF_Penalty + (Excess_Distance * Slope)
-        # Slope = 10.0 ensures a strong pull even when far away.
-        linear_slope = 1 #10.0
-        excess_distance = masked_diff - safe_width
-        linear_penalty = (-self.ln_k) + (excess_distance * linear_slope)
-        
-        # 5. Selection
         final_penalty = torch.where(
-            masked_diff <= safe_width,
+            masked_diff <= log_width,
             rbf_penalty,
             linear_penalty
         )
         
-        # Return Log-Similarity (Negative Penalty)
         return -1.0 * torch.sum(final_penalty, dim=-1)
     
     def _feature_similarity_log(self, prototype_features, gamma_features, batch_features):
