@@ -429,7 +429,8 @@ class EvidenceScorer(nn.Module):
         return (total_log_evidence - log_tau), {
             "rel": log_relational_similarity,
             "time": log_temporal_similarity,
-            "feat": log_feature_similarity
+            "feat": log_feature_similarity,
+            "tau": concept_prototype.tau
         }
     
 

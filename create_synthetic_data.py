@@ -112,7 +112,6 @@ class SchemaDrivenGenerator:
 
         print(f"Generated {K} subgraphs (Balanced: {K//2} pos, {K//2} neg).")
 
-
 def toy_amazon(params):
     toy_amazon_schema = Schema(
         root_type="customer",
@@ -161,7 +160,6 @@ def toy_amazon(params):
     dataset.create_toy_dataset(target_concept, K=params["K"], max_nodes_per_sub=10)
 
     return toy_amazon_schema, target_concept, dataset
-
 
 def collate_metapaths(subgraphs, max_hops, embed_dim, relation_count, n_samples=32):
     batch_relations, batch_times, batch_features = [], [], []
@@ -242,21 +240,29 @@ def print_ground_truth(concept, node_types):
 
 def print_contribution_report(components_list, labels):
     """
-    components_list: List of dicts from pHead forward pass
-    labels: Ground truth labels for the batch
+    Reports the similarity score (0-1) of the BEST path found in each positive subgraph.
     """
-    # Focus only on True Positives to see if the motif is being caught
     pos_mask = (labels == 1)
     
-    print(f"\n{'-'*20} SIMILARITY BREAKDOWN (Positive Samples) {'-'*20}")
+    print(f"\n{'-'*20} BEST PATH SIMILARITY (Positive Samples) {'-'*20}")
     print(f"{'Concept':<10} | {'Relational':<12} | {'Temporal':<12} | {'Feature':<12}")
     
     for c_idx, comp in enumerate(components_list["components"]):
-        # comp['rel'] is [Batch, Path_Samples]
-        # We want the average log-similarity across all paths in positive subgraphs
-        rel_avg = np.exp(comp['rel'][pos_mask].mean().item())
-        time_avg = np.exp(comp['time'][pos_mask].mean().item())
-        feat_avg = np.exp(comp['feat'][pos_mask].mean().item())
+        # 1. Get scores for positive samples: [N_Pos, N_Paths]
+        rel_scores = comp['rel'][pos_mask]
+        time_scores = comp['time'][pos_mask]
+        feat_scores = comp['feat'][pos_mask]
+        
+        # 2. Find the BEST path for each subgraph (Max Log-Probability)
+        # This gives us the score of the Motif Path, ignoring the Noise Paths
+        best_rel, _ = torch.max(rel_scores, dim=1)
+        best_time, _ = torch.max(time_scores, dim=1)
+        best_feat, _ = torch.max(feat_scores, dim=1)
+        
+        # 3. Convert to Probability (0-1) and Average across the batch
+        rel_avg = np.exp(best_rel.mean().item())
+        time_avg = np.exp(best_time.mean().item())
+        feat_avg = np.exp(best_feat.mean().item())
         
         print(f"ID {c_idx:<7} | {rel_avg:>12.2f} | {time_avg:>12.2f} | {feat_avg:>12.2f}")
     print(f"{'-'*75}")
@@ -274,7 +280,7 @@ if __name__ == "__main__":
         "num_concepts": 1,
         "num_epochs": 50,
         "batch_size": 10,
-        "training_steps": 500,
+        "training_steps": 1000,
         "relational_sharpness": 10,
         "lr": 0.005,
         "gamma_floor": 0.1,
@@ -327,7 +333,7 @@ if __name__ == "__main__":
         optimizer.step()
 
 
-        if i % 50 == 0:
+        if i % 100 == 0:
             pHead.eval()
             with torch.no_grad():
                 sampled_test = collate_metapaths(test_dataset.subgraphs, params["max_hops"], params["feature_embed_dim"], len(params["node_types"]))
@@ -354,9 +360,8 @@ if __name__ == "__main__":
     
 """
 TODO:
-- make visualisation better
-- push relational mass towards only possible relation matrices
 - implement successful sparsity
 - Ensure path generation complies with tau etc.
 - combat subpath matching
+- make visualisation better
 """
