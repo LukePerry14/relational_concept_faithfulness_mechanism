@@ -237,7 +237,6 @@ def print_ground_truth(concept, node_types):
     print(f"Saturation Threshold (Tau): {concept.tau:.3f}")
     print(f"{'='*85}\n")
 
-
 def print_contribution_report(components_list, labels):
     """
     Reports the similarity score (0-1) of the BEST path found in each positive subgraph.
@@ -277,7 +276,7 @@ if __name__ == "__main__":
         "K_test": 40,
         "node_types": ["customer", "review", "product"],
         "max_hops": 2,
-        "num_concepts": 1,
+        "num_concepts": 2,
         "num_epochs": 50,
         "batch_size": 10,
         "training_steps": 1000,
@@ -285,6 +284,8 @@ if __name__ == "__main__":
         "lr": 0.005,
         "gamma_floor": 0.1,
         "min_tau": 0.1,
+        "sparsity_weight": 0.05,
+        "warmup": 0.4
 
     }
     
@@ -324,11 +325,19 @@ if __name__ == "__main__":
 
         optimizer.zero_grad()
 
-        prediction_logit, _ = pHead(sampled_train)
+        prediction_logit, _, regularisation_terms = pHead(sampled_train)
 
         # ortho_loss = pHead.concept_orthogonality_regularisation()
-        loss = F.binary_cross_entropy_with_logits(prediction_logit, batch_labels.float()) #+ (1 * ortho_loss)
-    
+        task_loss = F.binary_cross_entropy_with_logits(prediction_logit, batch_labels.float()) #+ (1 * ortho_loss)
+
+        concept_sparsity_reg = params["sparsity_weight"] * regularisation_terms["activation_weights"]
+
+        discrete_regularsiation_loss = regularisation_terms["reg_terms"]
+        if i > params["warmup"] * params["training_steps"]:
+            loss = task_loss + (0.01 * discrete_regularsiation_loss) + discrete_regularsiation_loss
+        else:
+            loss = task_loss
+
         loss.backward()
         optimizer.step()
 
@@ -337,7 +346,7 @@ if __name__ == "__main__":
             pHead.eval()
             with torch.no_grad():
                 sampled_test = collate_metapaths(test_dataset.subgraphs, params["max_hops"], params["feature_embed_dim"], len(params["node_types"]))
-                test_logit, components = pHead(sampled_test)
+                test_logit, components, _ = pHead(sampled_test)
                 
                 # Metrics
                 test_preds = (test_logit > 0).long()

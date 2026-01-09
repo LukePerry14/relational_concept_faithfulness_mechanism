@@ -19,7 +19,6 @@ class PredictionHead(nn.Module):
         self.concept_weights = nn.Parameter(torch.ones(params["num_concepts"]))
         self.bias = nn.Parameter(torch.tensor([-1.0]))
 
-
     def inspect_concepts(self, node_types):
         """
         Summarizes concepts by zipping relations, times, and features into 
@@ -28,7 +27,7 @@ class PredictionHead(nn.Module):
         vocab = node_types + ["∅ (STOP)"]
         
         with torch.no_grad():
-            rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p = self.concept_decoder(self.concepts)
+            rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p, _ = self.concept_decoder(self.concepts)
         
         # Calculate non-negative weights from the additive head [cite: 328]
         positive_weights = torch.nn.functional.softplus(self.concept_weights).detach().cpu()
@@ -70,29 +69,28 @@ class PredictionHead(nn.Module):
         
         return rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p
 
-    def concept_orthogonality_regularisation(self):
-        """
-        Ensures latent concepts are distinct by penalizing cosine similarity.
-        """
-        # Normalize latent vectors
-        z_norm = F.normalize(self.concepts, p=2, dim=1)
-        # Compute self-similarity matrix [num_concepts, num_concepts]
-        sim_matrix = torch.matmul(z_norm, z_norm.t())
+    # def concept_orthogonality_regularisation(self):
+    #     """
+    #     Ensures latent concepts are distinct by penalizing cosine similarity.
+    #     """
+    #     # Normalize latent vectors
+    #     z_norm = F.normalize(self.concepts, p=2, dim=1)
+    #     # Compute self-similarity matrix [num_concepts, num_concepts]
+    #     sim_matrix = torch.matmul(z_norm, z_norm.t())
         
-        # Identity matrix (we don't penalize a concept matching itself)
-        identity = torch.eye(self.concepts.shape[0], device=self.concepts.device)
+    #     # Identity matrix (we don't penalize a concept matching itself)
+    #     identity = torch.eye(self.concepts.shape[0], device=self.concepts.device)
         
-        # Penalize any off-diagonal similarity
-        loss = torch.mean((sim_matrix - identity) ** 2)
-        return loss
+    #     # Penalize any off-diagonal similarity
+    #     loss = torch.mean((sim_matrix - identity) ** 2)
+    #     return loss
 
     def interpretable_forward_pass(self, sampled_metapaths):
         logits, pred_data = self.forward(sampled_metapaths)
 
-
     def forward(self, sampled_metapaths):
         # Decode global concepts from latent z
-        rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau = self.concept_decoder(self.concepts)
+        rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau, regularisation_terms = self.concept_decoder(self.concepts)
 
         # Calculate evidence mass over all concepts
         concept_activations = []
@@ -118,14 +116,13 @@ class PredictionHead(nn.Module):
         
 
         # Task Prediction
-        # activation_tensor = torch.sigmoid(torch.stack(concept_activations)).t() # [num_concepts]
         activation_tensor = torch.stack(concept_activations).t()
 
         weights = F.softplus(self.concept_weights)
 
         pred_logit = (activation_tensor * weights).sum(dim=1) + self.bias
 
-        return pred_logit, {"components": components_log, "activations": activation_tensor}
+        return pred_logit, {"components": components_log, "activations": activation_tensor}, {"reg_terms": regularisation_terms, "activation_weights": weights}
 
 class ConceptDecoder(nn.Module):
     def __init__(self, params):#concept_dim, feature_embed_dim, max_hops, relation_count, schema):
@@ -168,6 +165,18 @@ class ConceptDecoder(nn.Module):
             torch.nn.init.orthogonal_(m.weight, gain=2.0)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
+
+    def sparsity_regularisation(self, relation_matrix, gamma_time, gamma_feat):
+        
+        # Relational_sparsity with shannon entropy
+        epsilon = 1e-10
+        entropy = -torch.sum(relation_matrix * torch.log(relation_matrix + epsilon), dim=-1)
+        relational_sparsity = entropy.mean()
+        # temporal sparsity
+
+        # feature sparsity
+
+        return relational_sparsity
 
     def forward(self, concept_z):
         batch_size = concept_z.shape[0]
@@ -227,8 +236,10 @@ class ConceptDecoder(nn.Module):
         
         # Ensure unit sphere
         mu = F.normalize(mu, dim=-1)
-        
-        return relation_matrix, time, gamma_time, gamma_feat, mu, tau
+
+        regularisation_terms = self.sparsity_regularisation(relation_matrix, gamma_time, gamma_feat)
+
+        return relation_matrix, time, gamma_time, gamma_feat, mu, tau, regularisation_terms
 
 class EvidenceScorer(nn.Module):
     def __init__(self, relational_sharpness = 10, k=0.1):
@@ -310,42 +321,6 @@ class EvidenceScorer(nn.Module):
         path_dist = torch.sum(final_dist, dim=-1)
         
         return self.ln_k * path_dist
-
-    def _time_similarity_log_RBF(self, prototype_time, gamma_time, batch_times):
-        """
-        Computes Log-Similarity with Gradient Safety Guards.
-        Prevents explosion when gamma approaches zero.
-        """
-        mask = torch.isfinite(batch_times)
-        
-        # 1. Log-Space Conversion
-        log_proto = torch.log(prototype_time[None, None, :] + 1.0)
-        log_batch = torch.log(batch_times + 1.0)
-        
-        # Convert linear space gamma to logspace gamma
-        gamma_expanded = gamma_time[None, None, :] + self.EPS
-        log_upper = torch.log(prototype_time[None, None, :] + gamma_expanded + 1.0)
-        log_width = log_upper - log_proto
-                
-        # Log-Difference
-        log_diff = torch.abs(log_proto - log_batch)
-        masked_diff = torch.where(mask, log_diff, torch.zeros_like(log_diff))
-                
-        # Region A: Inside Safe Window
-        rbf_penalty = (-self.ln_k) * (masked_diff / log_width) ** 2
-        
-        # Region B: Linear Tail
-        linear_slope = 10.0 
-        excess_dist = masked_diff - log_width
-        linear_penalty = (-self.ln_k) + (excess_dist * linear_slope)
-        
-        final_penalty = torch.where(
-            masked_diff <= log_width,
-            rbf_penalty,
-            linear_penalty
-        )
-        
-        return -1.0 * torch.sum(final_penalty, dim=-1)
     
     def _feature_similarity_log(self, prototype_features, gamma_features, batch_features):
             """
