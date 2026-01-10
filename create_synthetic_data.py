@@ -178,11 +178,11 @@ def collate_metapaths(subgraphs, max_hops, embed_dim, relation_count, n_samples=
 
         sub_rels, sub_times, sub_feats = [], [], []
         
+        # Add paths to batch in compatible format
         for p in paths:
             # Root is index 0, Review is index 1, etc.
             rel_idx = [params["node_types"].index(t) if t != "∅" else relation_count for t in p.node_types]
             
-            # This ensures the root is always 0.0, matching the prototype
             root_time = p.node_times[0]
             norm_times = torch.tensor(p.node_times) - root_time
             
@@ -208,11 +208,11 @@ def print_ground_truth(concept, node_types):
     vocab = node_types + ["∅ (STOP)"]
     
     # Extract raw data
-    rel_p = concept.relational_prototype  # [L, R+1]
-    time_p = concept.time_prototype       # [L+1]
-    g_time_p = concept.time_gamma         # [L+1]
-    feat_p = concept.feature_prototype    # [L+1, D]
-    g_feat_p = concept.feature_gamma      # [L+1]
+    rel_p = concept.relational_prototype
+    time_p = concept.time_prototype
+    g_time_p = concept.time_gamma
+    feat_p = concept.feature_prototype
+    g_feat_p = concept.feature_gamma
     
     # Get node types via argmax
     path_indices = np.argmax(rel_p, axis=-1)
@@ -227,7 +227,6 @@ def print_ground_truth(concept, node_types):
         node_type  = full_type_path[h]
         time_str   = f"{time_p[h]:.1f} (±{g_time_p[h]:.1f})"
         
-        # Format features: [val, val] (±gamma)
         feat_vals  = ", ".join([f"{v:+.2f}" for v in feat_p[h]])
         feat_str   = f"[{feat_vals}] (±{g_feat_p[h]:.2f})"
         
@@ -247,18 +246,17 @@ def print_contribution_report(components_list, labels):
     print(f"{'Concept':<10} | {'Relational':<12} | {'Temporal':<12} | {'Feature':<12}")
     
     for c_idx, comp in enumerate(components_list["components"]):
-        # 1. Get scores for positive samples: [N_Pos, N_Paths]
+        # Get scores for positive samples
         rel_scores = comp['rel'][pos_mask]
         time_scores = comp['time'][pos_mask]
         feat_scores = comp['feat'][pos_mask]
         
-        # 2. Find the BEST path for each subgraph (Max Log-Probability)
-        # This gives us the score of the Motif Path, ignoring the Noise Paths
+        # Find the best path for each subgraph (Max Log-Probability)
         best_rel, _ = torch.max(rel_scores, dim=1)
         best_time, _ = torch.max(time_scores, dim=1)
         best_feat, _ = torch.max(feat_scores, dim=1)
         
-        # 3. Convert to Probability (0-1) and Average across the batch
+        # Convert to Probability (0-1) and Average across the batch
         rel_avg = np.exp(best_rel.mean().item())
         time_avg = np.exp(best_time.mean().item())
         feat_avg = np.exp(best_feat.mean().item())
@@ -276,7 +274,7 @@ if __name__ == "__main__":
         "K_test": 40,
         "node_types": ["customer", "review", "product"],
         "max_hops": 2,
-        "num_concepts": 2,
+        "num_concepts": 3,
         "num_epochs": 50,
         "batch_size": 10,
         "training_steps": 1000,
@@ -284,34 +282,36 @@ if __name__ == "__main__":
         "lr": 0.005,
         "gamma_floor": 0.1,
         "min_tau": 0.1,
-        "sparsity_weight": 0.05,
+        "sparsity_loss_weight": 0.05,
+        "diversity_loss_weight": 5, 
         "warmup": 0.4
 
     }
     
 
-
+    # 1) Generate Toy Data
     toy_amazon_schema, target_concept, train_dataset = toy_amazon({**params, "K": params["K_train"]})
     _, _, test_dataset = toy_amazon({**params, "K": params["K_test"]})  
-
-    
+    # Add schema to params
     params["schema"] = toy_amazon_schema
 
+    # Create Predicion head(includes concept decoder and evidence scorer)
     pHead = PredictionHead(params)
 
 
     # initialise optimiser
     optimizer = optim.Adam(pHead.parameters(), lr=0.01, weight_decay=1e-4)
     
+    # Create data splits
     train_idxs = list(range(params["K_train"]))
     test_idxs = list(range(params["K_test"]))
     train_labels = torch.tensor(train_dataset.labels)
     test_labels = torch.tensor(test_dataset.labels)
     
-    # train
     print("Beginning training...")
     for i in range(params["training_steps"]):
 
+        # Extract batch
         batch_indices = random.sample(train_idxs, params["batch_size"])
         batch_subgraphs = [train_dataset.subgraphs[idx] for idx in batch_indices]
         batch_labels = train_labels[batch_indices]
@@ -323,30 +323,35 @@ if __name__ == "__main__":
             len(params["node_types"])
         )
 
+        # Training step
         optimizer.zero_grad()
 
-        prediction_logit, _, regularisation_terms = pHead(sampled_train)
+        prediction_logit, meta = pHead(sampled_train)
 
-        # ortho_loss = pHead.concept_orthogonality_regularisation()
-        task_loss = F.binary_cross_entropy_with_logits(prediction_logit, batch_labels.float()) #+ (1 * ortho_loss)
+        task_loss = F.binary_cross_entropy_with_logits(prediction_logit, batch_labels.float())
 
-        concept_sparsity_reg = params["sparsity_weight"] * regularisation_terms["activation_weights"]
+        # Loss and regularisation
+        sparsity_loss = params["sparsity_loss_weight"] * meta["sparsity_loss"]
+        diversity_loss = params["diversity_loss_weight"] * meta["diversity_loss"]
 
-        discrete_regularsiation_loss = regularisation_terms["reg_terms"]
+        discrete_regularsiation_loss = meta["reg_terms"]
+        
+        loss = task_loss + diversity_loss #+ sparsity_loss
+        
+        # Warmup control
         if i > params["warmup"] * params["training_steps"]:
-            loss = task_loss + (0.01 * discrete_regularsiation_loss) + discrete_regularsiation_loss
-        else:
-            loss = task_loss
+            loss += 0.01 * discrete_regularsiation_loss
+
 
         loss.backward()
         optimizer.step()
 
-
+        # Evalutaion
         if i % 100 == 0:
             pHead.eval()
             with torch.no_grad():
                 sampled_test = collate_metapaths(test_dataset.subgraphs, params["max_hops"], params["feature_embed_dim"], len(params["node_types"]))
-                test_logit, components, _ = pHead(sampled_test)
+                test_logit, meta = pHead(sampled_test)
                 
                 # Metrics
                 test_preds = (test_logit > 0).long()
@@ -355,7 +360,7 @@ if __name__ == "__main__":
                 train_preds = (prediction_logit > 0).long()
                 train_acc = (train_preds == batch_labels).float().mean()
 
-                print_contribution_report(components, test_labels)
+                print_contribution_report(meta, test_labels)
                 
             pHead.train()
             print(f"Step {i:03d} | Loss: {loss.item():.4f} | train Acc: {train_acc:.2f} | test Acc: {test_acc:.2f}")
@@ -369,8 +374,11 @@ if __name__ == "__main__":
     
 """
 TODO:
-- implement successful sparsity
-- Ensure path generation complies with tau etc.
-- combat subpath matching
+- make relational sharpness learned
+- include self-learned temperature
+- temporal weight as hyperparameter
+- regularise similarity weights directly
+- more advanced concept sparsity
+- prevent relations from blocking one another.
 - make visualisation better
 """

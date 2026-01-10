@@ -8,6 +8,7 @@ class PredictionHead(nn.Module):
     def __init__(self, params):
         super().__init__()
 
+        # Scorer and concept decoder
         self.evidence_scorer = EvidenceScorer(relational_sharpness=params["relational_sharpness"])
         self.concept_decoder = ConceptDecoder(params)#params["concept_dim"], params["feature_embed_dim"], max_hops=params["max_hops"], relation_count=len(params["node_types"]), schema = params["schema"])
 
@@ -18,25 +19,33 @@ class PredictionHead(nn.Module):
         self.prediction_head = nn.Linear(params["num_concepts"], 2)
         self.concept_weights = nn.Parameter(torch.ones(params["num_concepts"]))
         self.bias = nn.Parameter(torch.tensor([-1.0]))
-
+        
+        
     def inspect_concepts(self, node_types):
         """
         Summarizes concepts by zipping relations, times, and features into 
         a vertical, readable path for each concept archetype.
         """
+        # vocab set for printing
         vocab = node_types + ["∅ (STOP)"]
         
+        # decode concept components
         with torch.no_grad():
             rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p, _ = self.concept_decoder(self.concepts)
         
-        # Calculate non-negative weights from the additive head [cite: 328]
+        
+        # Calculate concept weights for importance in activation
         positive_weights = torch.nn.functional.softplus(self.concept_weights).detach().cpu()
+        
         
         print(f"\n{'='*100}")
         print(f"{'ID':<4} | {'Tau (Saturation)':<18} | {'Prediction Weight':<18}")
         print(f"{'='*100}")
 
+        # Print on a per-concept basis
         for i in range(self.concepts.shape[0]):
+            
+            # Get tau and weight to understand concept
             tau_val = tau_p[i].item()
             weight_val = positive_weights[i].item()
             
@@ -45,19 +54,19 @@ class PredictionHead(nn.Module):
             print(f"{'Step':<10} | {'Node Type Distribution':<35} | {'Time (±γ)':<15} | {'Features (±γ)':<20}")
             print(f"{'-'*100}")
 
-            # Iterate through the hops (L) to pair data together 
+            # Iterate through the hops
             for h in range(rel_p.shape[1]):
-                # 1. Format Node Type Probs [cite: 49, 53]
+                # Format Node Type probabilites
                 probs = rel_p[i, h]
                 active_idx = torch.where(probs > 0.01)[0]
                 type_str = ", ".join([f"{vocab[idx]}({probs[idx]:.2f})" for idx in active_idx])
                 
-                # 2. Format Time [cite: 67, 71]
+                # Format Time
                 t_val = time_p[i, h].item()
                 t_gam = g_time_p[i, h].item()
                 time_str = f"{t_val:>4.1f} (±{t_gam:<4.1f})"
                 
-                # 3. Format Features [cite: 74, 75]
+                # Format Features
                 f_vec = feat_p[i, h].detach().cpu().numpy()
                 f_gam = g_feat_p[i, h].item()
                 f_str = f"[{', '.join([f'{v:+.2f}' for v in f_vec])}] (±{f_gam:.2f})"
@@ -69,35 +78,39 @@ class PredictionHead(nn.Module):
         
         return rel_p, time_p, g_time_p, g_feat_p, feat_p, tau_p
 
-    # def concept_orthogonality_regularisation(self):
-    #     """
-    #     Ensures latent concepts are distinct by penalizing cosine similarity.
-    #     """
-    #     # Normalize latent vectors
-    #     z_norm = F.normalize(self.concepts, p=2, dim=1)
-    #     # Compute self-similarity matrix [num_concepts, num_concepts]
-    #     sim_matrix = torch.matmul(z_norm, z_norm.t())
+    def concept_diversity_loss(self, rel_proto):
+        """Want to enforce concept sparsity, use rel_proto as first method for this"""
         
-    #     # Identity matrix (we don't penalize a concept matching itself)
-    #     identity = torch.eye(self.concepts.shape[0], device=self.concepts.device)
+        # Flatten relational matrix into vector
+        flat_protos = rel_proto.view(self.concepts.shape[0], -1)
         
-    #     # Penalize any off-diagonal similarity
-    #     loss = torch.mean((sim_matrix - identity) ** 2)
-    #     return loss
-
-    def interpretable_forward_pass(self, sampled_metapaths):
-        logits, pred_data = self.forward(sampled_metapaths)
+        # Normalize to unit vectors for cosine similarity (dot product)
+        flat_protos = F.normalize(flat_protos, p=2, dim=1)
+        
+        # Compute Similarity Matrix over concept vectors
+        similarity_matrix = torch.matmul(flat_protos, flat_protos.t())
+        
+        # Identity matrix represents perfect concept orthogonality
+        identity = torch.eye(self.concepts.shape[0], device=rel_proto.device)
+        
+        # MSE loss over non diagonal values
+        diversity_loss = torch.mean((similarity_matrix - identity) ** 2)
+        
+        return diversity_loss
+    
 
     def forward(self, sampled_metapaths):
         # Decode global concepts from latent z
-        rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau, regularisation_terms = self.concept_decoder(self.concepts)
+        rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau, reg_terms = self.concept_decoder(self.concepts)
 
         # Calculate evidence mass over all concepts
         concept_activations = []
         components_log = []
         
+        # For each concept
         for i in range(self.concepts.shape[0]):
-            # Extract the i-th decoded prototype
+            
+            # Store concept components as object
             prototype_object = type('Obj', (object,), {
                 'relations': rel_proto[i],
                 'times': t_proto[i],
@@ -106,27 +119,48 @@ class PredictionHead(nn.Module):
                 'gamma_features': gf_proto[i],
                 'tau': tau[i]
             })()
+            
+            # Calculate per subgraph similarity logits
             log_logit, components = self.evidence_scorer(prototype_object, sampled_metapaths)
 
+            # convert to similarity probability
             activation = torch.sigmoid(log_logit)
+            
+            # Store Concept Activations
             concept_activations.append(activation)
-            # concept_activations.append(log_logit)
-
+            
+            # Store runtime metadata
             components_log.append(components)
         
 
         # Task Prediction
         activation_tensor = torch.stack(concept_activations).t()
-
+        
+        # How many tasks are activating
+        sparsity_loss = activation_tensor.mean()
+        
+        # How different are the concepts
+        diversity_loss = self.concept_diversity_loss(rel_proto)
+        
+        # Prediction logit using weighted sum of concept activations
         weights = F.softplus(self.concept_weights)
-
         pred_logit = (activation_tensor * weights).sum(dim=1) + self.bias
 
-        return pred_logit, {"components": components_log, "activations": activation_tensor}, {"reg_terms": regularisation_terms, "activation_weights": weights}
+        return pred_logit, {
+            "components": components_log, 
+            "activations": activation_tensor,
+            "sparsity_loss": sparsity_loss,
+            "diversity_loss": diversity_loss,
+            "reg_terms": reg_terms
+        }
 
 class ConceptDecoder(nn.Module):
-    def __init__(self, params):#concept_dim, feature_embed_dim, max_hops, relation_count, schema):
+    """torch module to decode concepts from concept latents"""
+    
+    def __init__(self, params):
         super().__init__()
+        
+        # Parameter Extraction
         concept_dim = params["concept_dim"]
         feature_embed_dim = params["feature_embed_dim"]
         max_hops = params["max_hops"]
@@ -140,38 +174,45 @@ class ConceptDecoder(nn.Module):
         self.R = relation_count + 1
         self.D = feature_embed_dim
 
-        self.reachability_mask = torch.from_numpy(schema.reachability_mask(hop_count = params["max_hops"], ordered_node_types = params["node_types"]))
+        # Adjacency matrix to reduce relational search space        
         self.adj = torch.from_numpy(schema.get_adjacency_matrix(ordered_node_types = params["node_types"])).float()
 
-        # Shared Trunk
+        # Shared Trunk decoder
         self.trunk = nn.Sequential(
             nn.Linear(concept_dim, concept_dim * 4),
             nn.GELU(),
             nn.Linear(concept_dim * 4, concept_dim * 2)
         )
-                
+        
+        # Decoders
         self.relation_head = nn.Linear(concept_dim * 2, self.L * self.R)
         self.meta_head = nn.Linear(concept_dim * 2, (self.L * 3) + 1) # Handles (time, gamma_time, gamma_feat, tau)
         self.feature_head = nn.Linear(concept_dim * 2, self.L * self.D)
         
-        
-        self.relation_head.apply(self._init_weights)
-        self.meta_head.apply(self._init_weights)
-        self.feature_head.apply(self._init_weights)
+        # Weight initialisation
+        self.trunk.apply(self._init_trunk_weights)
+        self.relation_head.apply(self._init_head_weights)
+        self.meta_head.apply(self._init_head_weights)
+        self.feature_head.apply(self._init_head_weights)
 
-    def _init_weights(self, m):
+    def _init_trunk_weights(self, m):
         if isinstance(m, nn.Linear):
-            # Use a higher gain for the heads to ensure they vary with input
-            torch.nn.init.orthogonal_(m.weight, gain=2.0)
+            torch.nn.init.orthogonal_(m.weight, gain=math.sqrt(2)) # use root 2 initialisation to prevent killed gradients from GELU
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
 
-    def sparsity_regularisation(self, relation_matrix, gamma_time, gamma_feat):
-        
-        # Relational_sparsity with shannon entropy
+    def _init_head_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.orthogonal_(m.weight, gain=1.0) # use gain of 1 to make training more stable with exp and softplus functions
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+
+    def soft_discrete_regularisation(self, relation_matrix, gamma_time, gamma_feat):
+        # relational discretisation with shannon entropy
         epsilon = 1e-10
         entropy = -torch.sum(relation_matrix * torch.log(relation_matrix + epsilon), dim=-1)
         relational_sparsity = entropy.mean()
+        
         # temporal sparsity
 
         # feature sparsity
@@ -181,36 +222,38 @@ class ConceptDecoder(nn.Module):
     def forward(self, concept_z):
         batch_size = concept_z.shape[0]
         
-        # Viterbi algorithm
-
+        # 1) Decode concepts through trunk
         concept_state = self.trunk(concept_z)
         
-        # Decode Relations
+        # 2.1) Decode Relational matrix logits
         rel_logits = self.relation_head(concept_state).view(batch_size, self.L, self.R)
 
+        # 2.2) use schema defined reachability matrix to push logit mass towards possible paths
         adj = self.adj.to(concept_z.device)
-
         relation_probs = []
-        # Step 1: Root is fixed (e.g., Customer)
+        
+        # Define new probability matrix
         curr_prob = torch.zeros(batch_size, self.R).to(concept_z.device)
-        curr_prob[:, 0] = 1.0 # Index 0 is Root/Customer
+        
+        # Always start from root node
+        curr_prob[:, 0] = 1.0
         relation_probs.append(curr_prob)
         
-        # Sequential Masking
+        # sequential masking by hop
         for l in range(1, self.L):
             # Calculate reachability based on previous hop: [Batch, R] @ [R, R]
-            reachable = torch.matmul(curr_prob, adj) 
+            reachable = torch.matmul(curr_prob, adj)
             
             # Use reachability mask to ensure logit mass isn't applied to unreachable nodes
             hop_logits = rel_logits[:, l, :]
-            masked_logits = hop_logits.masked_fill(reachable == 0, -1e9)
-            
+            masked_logits = hop_logits.masked_fill(reachable < 1e-6, -1e9)            
             curr_prob = F.softmax(masked_logits, dim=-1)
             relation_probs.append(curr_prob)
             
+        # restack relation matirx
         relation_matrix = torch.stack(relation_probs, dim=1)
 
-        # Decode time and gamma tensors
+        # 3) Decode time and gamma tensors
         meta_flat = self.meta_head(concept_state)
         time_raw, gamma_time, gamma_feat, tau_raw = torch.split(
             meta_flat, 
@@ -218,33 +261,34 @@ class ConceptDecoder(nn.Module):
             dim=1
         )
         
-        # time = torch.cumsum(F.softplus(time_raw), dim=1)
-        # Treat time_raw as a the exponent in an exponentiation, allowing us to handle varying scales better and increase convergence time
+        # 3.1) treat time and time gamma as existing in logspace
         time = torch.exp(time_raw)
-        
-        # Enforce positivity on gammas
-        # make gamma_time exist in the same logspace for stability under different temporal resolutions
         gamma_time = torch.exp(gamma_time) + self.gamma_floor
+
+
+        # 3.2) simply enforce feature gammas to be positive
         gamma_feat = F.softplus(gamma_feat)
         
+        # 3.3) Positive tau
+        tau = F.softplus(tau_raw) + self.min_tau
         
-        tau = F.softplus(tau_raw) + self.min_tau # minimum tau requirement
-        
-        # Decode Features
+        # 4) Decode prototype feature vectors
         feat_flat = self.feature_head(concept_state)
         mu = feat_flat.view(batch_size, self.L, self.D)
         
-        # Ensure unit sphere
+        # Keep features as unit vectors for ease of similarity comparison
         mu = F.normalize(mu, dim=-1)
 
-        regularisation_terms = self.sparsity_regularisation(relation_matrix, gamma_time, gamma_feat)
+        # Generate sparsity regularisation terms
+        discretisation_regularisation_terms = self.soft_discrete_regularisation(relation_matrix, gamma_time, gamma_feat)
 
-        return relation_matrix, time, gamma_time, gamma_feat, mu, tau, regularisation_terms
+        return relation_matrix, time, gamma_time, gamma_feat, mu, tau, discretisation_regularisation_terms
 
 class EvidenceScorer(nn.Module):
     def __init__(self, relational_sharpness = 10, k=0.1):
         super().__init__()
-        self.relational_sharpness = relational_sharpness # complete guess
+        
+        self.relational_sharpness = relational_sharpness
         self.k = k
         self.ln_k = math.log(k)
         self.EPS = 1e-10
@@ -252,71 +296,58 @@ class EvidenceScorer(nn.Module):
 
     def _relational_similarity_log(self, prototype_relations, batch_relations):
         """
-        Computes Log-Similarity for relation sequence.
-        Exponential similarity = e^{-relational_sharpness*MSE} (updated from initial description to be logspace compatible)
-        relational_sharpness is functionaly identical to the gamma values, however, we want this to be as discrete as possible, we instead treat this as a hyperparameter
-        logspace similarity  = ln(-relational_sharpness*MSE) = -MSE
-
-        Parameter sizes:
-        prototype_relations = [L x R]
-        batch_relations = [B x P x L x R]
-
-        where:
-            - L is max metapath length
-            - R is the number of candidate relations
-            - B is the batch size
-            - P is the number of sampled metapaths per subgraph
+        Compute relational similarity as MSE from prototype
+        Handle in logspace for stability and similarity compatibility
+        Exponential similarity = e^{-relational_sharpness*MSE}, keeps values between 0-1
         """
         # Calculate Squared Difference between path encodings and prototype
         expanded_prototype = prototype_relations[None, None, :, :]
         diff_sq = (expanded_prototype - batch_relations) ** 2
         
-        # Mean Squared Error per path as before
-        mse = torch.mean(diff_sq, dim=(2, 3))  # [N]
+        # Simple Mean Squared Error
+        mse = torch.mean(diff_sq, dim=(2, 3))
         
+        # e^{-relational_sharpness*MSE}, keeps values between 0-1
         log_similarity = - 1 * self.relational_sharpness * mse 
         
-        return log_similarity  # Range: (-inf, 0]
+        return log_similarity
     
     def _time_similarity_log(self, prototype_time, gamma_time, batch_times):
         """
-        Computes Box-Distance in Log-Space with Huber Centering.
-        Prevents evidence vanishing for large distances.
+        Computes logspace Box-Distance for stability in unbounded search space in with Huber Centering for precision
         """
-        # 1. Masking & Input Sanitization
+        
+        # Masking to ignore irreleavant features
         mask = torch.isfinite(batch_times)
         safe_batch_times = torch.where(mask, batch_times, torch.zeros_like(batch_times))
 
-        # 2. Log-Space Conversion
+        # Update parameters to logspace
         log_proto = torch.log(prototype_time + 1.0)
         log_batch = torch.log(safe_batch_times + 1.0)
         log_width = torch.log(gamma_time + 1.0)
         
-        # 3. Box Boundaries
+        # Define Box Boundaries
         box_min = log_proto - log_width
         box_max = log_proto + log_width
         
-        # 4. Box Distance (L1)
+        # Compute distance to nearest face of hyper-box
         closest_point = torch.max(box_min, torch.min(log_batch, box_max))
         dist_to_box = torch.abs(log_batch - closest_point)
         
-        # 5. Huber Center Alignment [The Fix]
-        # Quadratic when error < 1.0 (Log-Scale), Linear when error > 1.0.
-        # This caps the penalty growth, keeping the Time Evidence "alive" 
-        # (e.g., -15 instead of -168) so the model attends to it.
+        # Huber style box Center Alignment
         dist_to_center = torch.abs(log_batch - log_proto)
         
-        # We use a weight of 5.0 to balance with Feature/Relation scales
-        center_pull = 5.0 * torch.where(
-            dist_to_center < 1.0,
-            dist_to_center ** 2,       # Quadratic (Precision)
-            (2.0 * dist_to_center) - 1.0 # Linear (Robustness) - matched derivative at 1.0
+        # Quadratic when error < 1.0 (Log-Scale), Linear when error > 1.0
+        center_pull = 5.0 * torch.where( # 5 is chosen arbitrarily
+            dist_to_center < 1.0, # Assumes log-scale sub 1 is reasonable (should be true for day scale)
+            dist_to_center ** 2, # Quadratic center
+            (2.0 * dist_to_center) - 1.0 # Linear outside of box
         )
         
-        # Combine
+        # Combine center pull (box centralisation) and outside the box (box boundaries) pulls
         total_log_dist = dist_to_box + center_pull
         
-        # 6. Re-Apply Mask & Aggregate
+        # Reapply mask to prevent gradient from dummy nodes
         final_dist = torch.where(mask, total_log_dist, torch.zeros_like(total_log_dist))
         path_dist = torch.sum(final_dist, dim=-1)
         
@@ -324,10 +355,10 @@ class EvidenceScorer(nn.Module):
     
     def _feature_similarity_log(self, prototype_features, gamma_features, batch_features):
             """
-            Calculates Log-Similarity for features following the reparameterized RBF kernel.
-            Returns: [Batch, Path_Count]
+            Calculates Log-Similarity for features usine cosine similarity on unit sphere representations
             """
-            # Create mask for padded data [subgraphs, paths, path_length]
+            
+            # Create mask for padded data
             mask = torch.isfinite(batch_features).all(dim=-1)
 
             # Convert embeddings to unit vectors for cosine
@@ -336,7 +367,7 @@ class EvidenceScorer(nn.Module):
             safe_batch_features = torch.where(mask.unsqueeze(-1), batch_features, torch.zeros_like(batch_features))
             batch_norm = F.normalize(safe_batch_features, p=2, dim=-1, eps=self.EPS)
 
-            # Compute Cosine Similarity: [subgraphs, paths, path_length]
+            # Compute Cosine Similarity
             cosine_similarity = torch.sum(batch_norm * prototype_norm, dim=-1)
 
             # Convert to Distance: [-1, 1] -> [0, 1] (lower is closer)
@@ -347,14 +378,13 @@ class EvidenceScorer(nn.Module):
 
             # Clamp similarity ratio to prevent huge distances from exploding gradients
             similarity_ratio = similarity_distance / gamma_features_expanded
-            # clamped_similarity_ratio = torch.clamp(similarity_ratio, max=50)
             clamped_similarity_ratio = F.softsign(similarity_ratio)
             norm_dist_sq = (clamped_similarity_ratio) ** 2
 
             # reapply mask to ensure null nodes don't generate signal
             final_penalty = torch.where(mask, norm_dist_sq, torch.zeros_like(norm_dist_sq))
 
-            # Sum penalty over nodes to create penalty for full path [subgraphs, paths, path_length] -> [subgraphs, paths]
+            # Sum penalty over nodes to create penalty for full path
             total_path_penalty = torch.sum(final_penalty, dim=-1)
 
             # Return Log-Similarity for EACH path
@@ -362,7 +392,7 @@ class EvidenceScorer(nn.Module):
 
     def aggregate_evidence_log(self, log_s_rel, log_s_time, log_s_feat):
         # Combine log similarities (Multiplication becomes Addition)
-        log_s_tot = log_s_rel + log_s_time + log_s_feat  # [N_paths]
+        log_s_tot = log_s_rel + log_s_time + log_s_feat
         
         # Aggregate mass 
         log_M = torch.logsumexp(log_s_tot, dim=-1)
