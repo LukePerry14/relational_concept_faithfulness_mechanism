@@ -284,7 +284,12 @@ if __name__ == "__main__":
         "min_tau": 0.1,
         "sparsity_loss_weight": 0.05,
         "diversity_loss_weight": 5, 
-        "warmup": 0.4
+        "warmup": 0.4,
+        "num_concepts": 4,
+        "num_clauses": 4,
+        "sparsity_weight": 0.5,
+        "discrete_weight": 0.05,
+        "diversity_weight": 0.1,
 
     }
     
@@ -311,6 +316,10 @@ if __name__ == "__main__":
     print("Beginning training...")
     for i in range(params["training_steps"]):
 
+        progress = i / params["training_steps"]
+        current_temp = max(0.01, 1.0 - progress)
+        pHead.logic_head.temp.fill_(current_temp)
+
         # Extract batch
         batch_indices = random.sample(train_idxs, params["batch_size"])
         batch_subgraphs = [train_dataset.subgraphs[idx] for idx in batch_indices]
@@ -326,24 +335,20 @@ if __name__ == "__main__":
         # Training step
         optimizer.zero_grad()
 
-        prediction_logit, meta = pHead(sampled_train)
+        prediction_logit, info = pHead(sampled_train)
 
         task_loss = F.binary_cross_entropy_with_logits(prediction_logit, batch_labels.float())
 
         # Loss and regularisation
-        sparsity_loss = params["sparsity_loss_weight"] * meta["sparsity_loss"]
-        diversity_loss = params["diversity_loss_weight"] * meta["diversity_loss"]
-
-        discrete_regularsiation_loss = meta["reg_terms"]
-        
-        loss = task_loss + diversity_loss #+ sparsity_loss
-        
-        # Warmup control
-        if i > params["warmup"] * params["training_steps"]:
-            loss += 0.01 * discrete_regularsiation_loss
+        total_loss = (
+            task_loss +
+            (params["sparsity_weight"] * info["sparsity_loss"]) +
+            (params["discrete_weight"] * info["discrete_relations"]) +
+            (params["diversity_weight"] * info["diversity_loss"])
+        )
 
 
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
 
         # Evalutaion
@@ -351,7 +356,7 @@ if __name__ == "__main__":
             pHead.eval()
             with torch.no_grad():
                 sampled_test = collate_metapaths(test_dataset.subgraphs, params["max_hops"], params["feature_embed_dim"], len(params["node_types"]))
-                test_logit, meta = pHead(sampled_test)
+                test_logit, info = pHead(sampled_test)
                 
                 # Metrics
                 test_preds = (test_logit > 0).long()
@@ -360,10 +365,10 @@ if __name__ == "__main__":
                 train_preds = (prediction_logit > 0).long()
                 train_acc = (train_preds == batch_labels).float().mean()
 
-                print_contribution_report(meta, test_labels)
+                print_contribution_report(info, test_labels)
                 
             pHead.train()
-            print(f"Step {i:03d} | Loss: {loss.item():.4f} | train Acc: {train_acc:.2f} | test Acc: {test_acc:.2f}")
+            print(f"Step {i:04d} | Temp: {current_temp:.4f} | Loss: {total_loss.item():.4f} | Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f}")
 
     print("\nTraining Complete.")
     print_ground_truth(target_concept, params["node_types"])
