@@ -227,7 +227,7 @@ class PredictionHead(nn.Module):
     
     def forward(self, sampled_metapaths):
         # Decode global concepts from latent z
-        rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau, discrete_relations_loss = self.concept_decoder(self.concepts)
+        rel_proto, t_proto, gt_proto, gf_proto, mu_proto, tau, regularisation_terms = self.concept_decoder(self.concepts)
 
         # Calculate evidence mass over all concepts
         concept_activations = []
@@ -278,12 +278,12 @@ class PredictionHead(nn.Module):
             "activations": activation_tensor,
             "sparsity_loss": sparsity_loss,
             "diversity_loss": div_loss,
-            "discrete_relations": discrete_relations_loss,
-            "logic_debug": logic_info
+            "logic_debug": logic_info,
+            **regularisation_terms
         }
 
 class ConceptDecoder(nn.Module):
-    """torch module to decode concepts from concept latents"""
+    """Autoregressive style decoder to decode human interpretable concepts from latents"""
     
     def __init__(self, params):
         super().__init__()
@@ -312,16 +312,22 @@ class ConceptDecoder(nn.Module):
             nn.Linear(concept_dim * 4, concept_dim * 2)
         )
         
+        self.hidden_dim = concept_dim * 2
+
         # Decoders
-        self.relation_head = nn.Linear(concept_dim * 2, self.L * self.R)
-        self.meta_head = nn.Linear(concept_dim * 2, (self.L * 3) + 1) # Handles (time, gamma_time, gamma_feat, tau)
-        self.feature_head = nn.Linear(concept_dim * 2, self.L * self.D)
+        self.conditional_GRU_cell = nn.GRUCell(self.hidden_dim + self.R, self.hidden_dim) # Decode hop level conditional state
+        self.relation_head = nn.Linear(self.hidden_dim, self.R) # decode next relation
+        self.time_head = nn.Linear(self.hidden_dim, 2) # Decode Time and time gamma
+        self.feature_head = nn.Linear(self.hidden_dim, self.D + 1) # decode feature vector and feature gamma
+        self.tau_head = nn.Linear(self.hidden_dim, 1) # decode concept level tau
         
         # Weight initialisation
         self.trunk.apply(self._init_trunk_weights)
+        self.conditional_GRU_cell.apply(self._init_head_weights)
         self.relation_head.apply(self._init_head_weights)
-        self.meta_head.apply(self._init_head_weights)
+        self.time_head.apply(self._init_head_weights)
         self.feature_head.apply(self._init_head_weights)
+        self.tau_head.apply(self._init_head_weights)
 
     def _init_trunk_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -343,71 +349,75 @@ class ConceptDecoder(nn.Module):
 
         return discrete_relations_loss
 
-
     def forward(self, concept_z):
-        batch_size = concept_z.shape[0]
+        num_concepts = concept_z.shape[0]
         
         # 1) Decode concepts through trunk
         concept_state = self.trunk(concept_z)
         
-        # 2.1) Decode Relational matrix logits
-        rel_logits = self.relation_head(concept_state).view(batch_size, self.L, self.R)
+        # Use temporary hidden state tracking for proper RNN unraveling
+        hidden = concept_state
 
-        # 2.2) use schema defined reachability matrix to push logit mass towards possible paths
+        # 2) Build valid relations
         adj = self.adj.to(concept_z.device)
-        relation_probs = []
-        
-        # Define new probability matrix
-        curr_prob = torch.zeros(batch_size, self.R).to(concept_z.device)
-        
-        # Always start from root node
-        curr_prob[:, 0] = 1.0
-        relation_probs.append(curr_prob)
-        
-        # sequential masking by hop
-        for l in range(1, self.L):
-            # Calculate reachability based on previous hop: [Batch, R] @ [R, R]
-            reachable = torch.matmul(curr_prob, adj)
+        relation_probs = [torch.zeros(num_concepts, self.R).to(concept_z.device)]
+        relation_probs[0][:, 0] = 1.0
+
+        # Decode global tau
+        tau = F.softplus(self.tau_head(hidden)) + self.min_tau
+
+        features, gamma_feats, times, gamma_times = [], [], [], []
+
+        # Use RNN to unravel concept autoregressively
+        for hop in range(self.L):
+            conditonal_concept_state = self.conditional_GRU_cell(torch.cat([concept_state, relation_probs[-1]], dim=-1), hidden)
+
+            curr_features, curr_gamma_feats = torch.split(self.feature_head(conditonal_concept_state), [self.D, 1], dim=1)
+
+            curr_features = F.normalize(curr_features.view(num_concepts, self.D), dim=-1)
+            curr_gamma_feats = F.sigmoid(curr_gamma_feats)
+
+            features.append(curr_features)
+            gamma_feats.append(curr_gamma_feats)
+
+            curr_times, curr_gamma_times = torch.split(self.time_head(conditonal_concept_state), [1, 1], dim=1)
             
-            # Use reachability mask to ensure logit mass isn't applied to unreachable nodes
-            hop_logits = rel_logits[:, l, :]
-            masked_logits = hop_logits.masked_fill(reachable < 1e-6, -1e9)            
-            curr_prob = F.softmax(masked_logits, dim=-1)
-            relation_probs.append(curr_prob)
+            if hop == 0:
+                time_delta = torch.zeros_like(curr_times)
+            else:
+                time_delta = torch.exp(curr_times)
+            curr_gamma_times = torch.exp(curr_gamma_times) + self.gamma_floor
             
-        # restack relation matirx
-        relation_matrix = torch.stack(relation_probs, dim=1)
-
-        # 3) Decode time and gamma tensors
-        meta_flat = self.meta_head(concept_state)
-        time_raw, gamma_time, gamma_feat, tau_raw = torch.split(
-            meta_flat, 
-            [self.L, self.L, self.L, 1], 
-            dim=1
-        )
-        
-        # 3.1) treat time and time gamma as existing in logspace
-        time = torch.exp(time_raw)
-        gamma_time = torch.exp(gamma_time) + self.gamma_floor
+            
+            times.append(time_delta)
+            gamma_times.append(curr_gamma_times)
 
 
-        # 3.2) simply enforce feature gammas to be positive
-        gamma_feat = F.sigmoid(gamma_feat)
-        
-        # 3.3) Positive tau
-        tau = F.softplus(tau_raw) + self.min_tau
-        
-        # 4) Decode prototype feature vectors
-        features_flat = self.feature_head(concept_state)
-        features = features_flat.view(batch_size, self.L, self.D)
-        
-        # Keep features as unit vectors for ease of similarity comparison
-        features = F.normalize(features, dim=-1)
+            next_rel_prob_logits = self.relation_head(conditonal_concept_state)
+            reachable = torch.matmul(relation_probs[-1], adj)
+            masked_logits = next_rel_prob_logits.masked_fill(reachable == 0, -1e9)
 
-        # Generate sparsity regularisation terms
-        discretisation_regularisation_terms = self.soft_discrete_regularisation(relation_matrix)
+            chosen_relation = F.gumbel_softmax(masked_logits, tau=5, hard=False)
 
-        return relation_matrix, time, gamma_time, gamma_feat, features, tau, discretisation_regularisation_terms
+            if hop != (self.L-1):
+                relation_probs.append(chosen_relation)
+
+                hidden = conditonal_concept_state
+            
+
+        # Stack data together
+        relation_matrix = torch.stack(relation_probs, dim = 1)
+        stacked_time = torch.cumsum(torch.stack(times, dim=1), dim=1).squeeze(-1)
+        stacked_gamma_time = torch.stack(gamma_times, dim=1).squeeze(-1)
+        stacked_features = torch.stack(features, dim=1)
+        stacked_gamma_features = torch.stack(gamma_feats, dim =1).squeeze(-1)
+
+        # Generate regularisation terms
+        gamma_time_penalty = torch.log(stacked_gamma_time + 1.0).mean()
+        gamma_feature_penalty = torch.log(stacked_gamma_features + 1.0).mean()
+        discrete_loss = self.soft_discrete_regularisation(relation_matrix)
+
+        return relation_matrix, stacked_time, stacked_gamma_time, stacked_gamma_features, stacked_features, tau, {"discrete_loss": discrete_loss, "gamma_time_penalty": gamma_time_penalty, "gamma_feature_penalty": gamma_feature_penalty}
 
 class EvidenceScorer(nn.Module):
     def __init__(self, relational_sharpness = 10, k=0.1):
@@ -424,6 +434,7 @@ class EvidenceScorer(nn.Module):
         Compute relational similarity as MSE from prototype
         Handle in logspace for stability and similarity compatibility
         Exponential similarity = e^{-relational_sharpness*MSE}, keeps values between 0-1
+        Gumbel-Softmax based
         """
         # Calculate Squared Difference between path encodings and prototype
         expanded_prototype = prototype_relations[None, None, :, :]
@@ -438,49 +449,39 @@ class EvidenceScorer(nn.Module):
         return log_similarity
     
     def _time_similarity_log(self, prototype_time, gamma_time, batch_times):
-        """
-        Computes logspace Box-Distance for stability in unbounded search space in with Huber Centering for precision
-        """
-        
-        # Masking to ignore irreleavant features
+        # 1. Masking
         mask = torch.isfinite(batch_times)
         safe_batch_times = torch.where(mask, batch_times, torch.zeros_like(batch_times))
 
-        # Update parameters to logspace
-        log_proto = torch.log(prototype_time + 1.0)
-        log_batch = torch.log(safe_batch_times + 1.0)
-        log_width = torch.log(gamma_time + 1.0)
+        # 2. Absolute Distance (The Gravity Source)
+        dist_to_center = torch.abs(safe_batch_times - prototype_time)
         
-        # Define Box Boundaries
-        box_min = log_proto - log_width
-        box_max = log_proto + log_width
+        # 3. The Hinge (The Constraint)
+        excess_dist = dist_to_center - gamma_time
+        constraint_penalty = F.softplus(excess_dist, beta=5.0)
         
-        # Compute distance to nearest face of hyper-box
-        closest_point = torch.max(box_min, torch.min(log_batch, box_max))
-        dist_to_box = torch.abs(log_batch - closest_point)
+        # 4. Interior Gravity (The Centering Fix)
+        # Adds a tiny pull towards the center even for points inside the box.
+        # This prevents the prototype from drifting aimlessly within the valid window.
+        gravity_penalty = 0.01 * dist_to_center 
         
-        # Huber style box Center Alignment
-        dist_to_center = torch.abs(log_batch - log_proto)
+        # 5. Combined Penalty
+        # Constraint (Hard Boundaries) + Gravity (Soft Centering)
+        total_penalty = constraint_penalty + gravity_penalty
         
-        # Quadratic when error < 1.0 (Log-Scale), Linear when error > 1.0
-        center_pull = 5.0 * torch.where( # 5 is chosen arbitrarily
-            dist_to_center < 1.0, # Assumes log-scale sub 1 is reasonable (should be true for day scale)
-            dist_to_center ** 2, # Quadratic center
-            (2.0 * dist_to_center) - 1.0 # Linear outside of box
-        )
+        # 6. Apply Relational Sharpness
+        weighted_penalty = self.relational_sharpness * total_penalty
         
-        # Combine center pull (box centralisation) and outside the box (box boundaries) pulls
-        total_log_dist = dist_to_box + center_pull
+        # 7. Reapply Mask and Sum
+        final_penalty = torch.where(mask, weighted_penalty, torch.zeros_like(weighted_penalty))
+        path_penalty = torch.sum(final_penalty, dim=-1)
         
-        # Reapply mask to prevent gradient from dummy nodes
-        final_dist = torch.where(mask, total_log_dist, torch.zeros_like(total_log_dist))
-        path_dist = torch.sum(final_dist, dim=-1)
-        
-        return self.ln_k * path_dist
+        return -1 * path_penalty
     
     def _feature_similarity_log(self, prototype_features, gamma_features, batch_features):
             """
             Calculates Log-Similarity for features usine cosine similarity on unit sphere representations
+            similar to Von Mises-Fisher Distribution
             """
             
             # Create mask for padded data
