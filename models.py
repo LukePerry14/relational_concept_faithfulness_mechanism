@@ -552,3 +552,35 @@ class EvidenceScorer(nn.Module):
             "feat": log_feature_similarity,
             "tau": concept_prototype.tau
         }
+
+
+class AuxilliaryCBM(nn.Module):
+    """"""
+    def __init__(self, cartModel, bottleneckModel, params):
+        super().__init__()
+        
+        # self.sampler = sampler
+        # self.encoder = encoder
+        
+        self.cartModel = cartModel
+        
+        self.bottlneckModel = bottleneckModel
+        
+        self.total_steps = params["total_steps"]
+        
+        self.warmup_steps = params["warmup_steps"]
+        
+    def get_alpha_linear(self, current_step):
+        
+        if current_step < self.warmup_steps:
+            return 0
+        
+        else:
+            
+            schedule_progress = (current_step - self.warmup_steps) / (self.total_steps - self.warmup_steps)
+        
+        return schedule_progress
+        
+    
+    def forward(self, encoder, batch_subgraph, current_step):
+        embeddings = self.encoder(batch_subgraph)

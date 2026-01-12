@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 
 # Note: This assumes your PredictionHead and ConceptDecoder classes are importable
-from evidence_scoring_head import PredictionHead
+from models import PredictionHead
 
 def load_model(path, params):
     model = PredictionHead(params)

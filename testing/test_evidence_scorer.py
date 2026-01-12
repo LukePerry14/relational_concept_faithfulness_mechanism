@@ -2,7 +2,7 @@ import unittest
 import torch
 import math
 from dataclasses import dataclass
-from evidence_scoring_head import EvidenceScorer, ConceptDecoder
+from models import EvidenceScorer, ConceptDecoder
 import numpy as np
 import torch.optim as optim
 import torch.nn.functional as F

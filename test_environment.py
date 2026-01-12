@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 from utils.custom_dataclasses import Schema, Concept, MetaPath, NULL_TOKEN
 from utils.faithfulness_poc import Subgraph
-from evidence_scoring_head import PredictionHead
+from models import PredictionHead
 import random
 import torch.optim as optim
 from concept_dashboard import run_dashboard

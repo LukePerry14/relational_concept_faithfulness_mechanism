@@ -8,7 +8,7 @@ import os
 # Add parent directory to path to import your modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from evidence_scoring_head import ConceptDecoder, EvidenceScorer
+from models import ConceptDecoder, EvidenceScorer
 from utils.custom_dataclasses import Schema, NULL_TOKEN
 
 def run_relational_unit_test():
