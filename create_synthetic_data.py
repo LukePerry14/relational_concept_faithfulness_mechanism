@@ -265,6 +265,67 @@ def print_contribution_report(components_list, labels):
     print(f"{'-'*75}")
 
 
+import torch
+import torch.nn.functional as F
+
+def test_diversity_logic():
+    # Setup dimensions
+    K, L, R, D = 2, 3, 3, 2  # 2 Concepts, Path Length 3, 3 Rel Types, 2 Feat Dims
+    
+    # ---------------------------------------------------------
+    # SCENARIO 1: HIGH REDUNDANCY (Identical Active Concepts)
+    # ---------------------------------------------------------
+    # Both concepts are exactly the same
+    rel = torch.ones(K, L, R + 1) 
+    time = torch.ones(K, L) * 10.0
+    feat = torch.ones(K, L, D)
+    # Both are fully active in the batch
+    activations = torch.ones(10, K) 
+    
+    loss_redundant = calculate_diversity(rel, time, feat, activations)
+    
+    # ---------------------------------------------------------
+    # SCENARIO 2: ORTHOGONAL (Distinct Active Concepts)
+    # ---------------------------------------------------------
+    # Concept 0 and Concept 1 have non-overlapping features/relations
+    feat_ortho = torch.zeros(K, L, D)
+    feat_ortho[0, :, 0] = 1.0  # Concept 0 focuses on Feat Dim 0
+    feat_ortho[1, :, 1] = 1.0  # Concept 1 focuses on Feat Dim 1
+    
+    loss_ortho = calculate_diversity(rel, time, feat_ortho, activations)
+
+    # ---------------------------------------------------------
+    # SCENARIO 3: REDUNDANT BUT MASKED (Garbage Concept)
+    # ---------------------------------------------------------
+    # Concepts are identical, but Concept 1 has ZERO activation
+    acts_masked = torch.zeros(10, K)
+    acts_masked[:, 0] = 1.0 # Only Concept 0 is active
+    
+    loss_masked = calculate_diversity(rel, time, feat, acts_masked)
+
+    print(f"Redundant Loss: {loss_redundant:.6f} (Should be High)")
+    print(f"Orthogonal Loss: {loss_ortho:.6f} (Should be Low/Zero)")
+    print(f"Masked Loss:     {loss_masked:.6f} (Should be Zero - Concept 1 is garbage)")
+
+def calculate_diversity(rel_proto, time_proto, feat_proto, activations):
+    # Your current implementation
+    num_concepts = rel_proto.shape[0]
+    flat_rel = F.normalize(rel_proto.view(num_concepts, -1), p=2, dim=1)
+    norm_time = F.normalize(torch.tanh(time_proto).view(num_concepts, -1), p=2, dim=1)
+    flat_feat = F.normalize(feat_proto.view(num_concepts, -1), p=2, dim=1)
+    
+    fingerprints = F.normalize(torch.cat([flat_rel, norm_time, flat_feat], dim=1), p=2, dim=1)
+    similarity_matrix = torch.matmul(fingerprints, fingerprints.t())
+    
+    # SEL-style max activation weighting
+    max_activations = torch.max(activations, dim=0).values 
+    activation_mask = torch.outer(max_activations, max_activations)
+    
+    identity = torch.eye(num_concepts, device=rel_proto.device)
+    off_diagonal_error = (similarity_matrix - identity) ** 4
+    
+    return (off_diagonal_error * activation_mask).sum()
+
 
 if __name__ == "__main__":
     params = {
@@ -280,10 +341,10 @@ if __name__ == "__main__":
         "training_steps": 1000,
         "relational_sharpness": 10,
         "lr": 0.005,
-        "gamma_floor": 0.1,
+        "gamma_floor": 1,
         "min_tau": 0.1,
         "sparsity_loss_weight": 0.05,
-        "diversity_loss_weight": 5, 
+        "diversity_loss_weight": 10, 
         "warmup": 0.4,
         "num_concepts": 4,
         "num_clauses": 4,
@@ -342,9 +403,10 @@ if __name__ == "__main__":
         # Loss and regularisation
         total_loss = (
             task_loss +
-            (params["sparsity_weight"] * info["sparsity_loss"]) +
             (params["discrete_weight"] * info["discrete_relations"]) +
-            (params["diversity_weight"] * info["diversity_loss"])
+            current_temp * 
+            ((params["sparsity_weight"] * info["sparsity_loss"]) +
+            (params["diversity_weight"] * info["diversity_loss"]))
         )
 
 

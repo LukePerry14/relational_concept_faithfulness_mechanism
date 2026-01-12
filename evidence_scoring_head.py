@@ -183,64 +183,45 @@ class PredictionHead(nn.Module):
 
             print(f"{'='*100}\n")
     
-    def activation_weighted_diversity_loss(self, relation_prototype, time_prototype, feature_prototype, activations):
+    def activation_weighted_diversity_loss(self, relation_prototype, time_prototype, feature_prototype, activations, activation_method="max", path_normalisation=False):
         """
         Calculate the orthogonality between decoded concept prototypes.
         Scale this loss by concept co-activation in the logic head to prevent garbage concepts from becoming blocking
         """
-        K = relation_prototype.shape[0]
+        num_concepts = relation_prototype.shape[0]
         
-        # 1. FLATTEN AND NORMALIZE COMPONENTS SEPARATELY
-        # We normalize each modality *before* concatenation so that 
-        # Relations (probs), Time (years), and Features (embeddings) contribute equally.
+        # Flatten and normalise meta-path concept components
+        flat_rel = F.normalize(relation_prototype.view(num_concepts, -1), p=2, dim=1)
+        norm_time = F.normalize(torch.sigmoid(time_prototype).view(num_concepts, -1), p=2, dim=1)
+        flat_feat = F.normalize(feature_prototype.view(num_concepts, -1), p=2, dim=1)
         
-        # Relations: [K, L, R] -> [K, L*R]
-        flat_rel = F.normalize(relation_prototype.view(K, -1), p=2, dim=1)
+        # Flattened concept vector
+        concat_vectors = F.normalize(torch.cat([flat_rel, norm_time, flat_feat], dim=1), p=2, dim=1)
+                
+        # Similarity matrix of flattened vectors
+        similarity_matrix = torch.matmul(concat_vectors, concat_vectors.t())
         
-        # Time: [K, L] -> [K, L]
-        # Note: We use softsign/tanh on time first to bound it, as raw years (e.g. 2022) 
-        # can dominate the norm.
-        norm_time = F.normalize(torch.tanh(time_prototype).view(K, -1), p=2, dim=1)
+        # Only penalise concepts which are being used
+        if activation_method == "max":
+            max_activations = torch.max(activations, 0).values
+        elif activation_method == "mean":
+            max_activations = torch.mean(max_activations, dim=0)
         
-        # Features: [K, L, D] -> [K, L*D]
-        flat_feat = F.normalize(feature_prototype.view(K, -1), p=2, dim=1)
+        # Use outer product to produce weights for orthogonality only if both concepts are non-garbage
+        activation_mask = torch.outer(max_activations, max_activations)
         
-        # 2. CREATE UNIFIED CONCEPT FINGERPRINT
-        # [K, (LR + L + LD)]
-        fingerprints = torch.cat([flat_rel, norm_time, flat_feat], dim=1)
+        # Determine vector similarity using MSE style calculation (ignore simlarity to self)
+        identity = torch.eye(num_concepts, device=relation_prototype.device)
+        off_diagonal_error = torch.abs(similarity_matrix - identity)
         
-        # Normalize the combined fingerprint so dot product = cosine similarity
-        fingerprints = F.normalize(fingerprints, p=2, dim=1)
-        
-        # 3. COMPUTE SIMILARITY MATRIX (S)
-        # S_ij = Similarity between Concept i and Concept j
-        # Range: [-1, 1]
-        similarity_matrix = torch.matmul(fingerprints, fingerprints.t())
-        
-        # 4. COMPUTE ACTIVATION MASK (M)
-        # We want to penalize S_ij only if BOTH i and j are active.
-        # activations: [Batch, K]
-        # mean_act: [K] (Average activation of each concept across the batch)
-        mean_act = activations.mean(dim=0)
-        
-        # mask_ij = mean_act[i] * mean_act[j]
-        # Shape: [K, K]
-        activation_mask = torch.outer(mean_act, mean_act)
-        
-        # 5. WEIGHTED LOSS
-        # Target: Identity Matrix (I). We only care about Off-Diagonals.
-        identity = torch.eye(K, device=relation_prototype.device)
-        
-        # Squared Error on Off-Diagonals
-        off_diagonal_error = (similarity_matrix - identity) ** 2
-        
-        # Apply Mask: Overlap is only penalized if concepts are active
-        # We detach the mask so we don't discourage activation just to minimize diversity loss.
+        # Mask these values by max activations of concepts
         weighted_error = off_diagonal_error * activation_mask.detach()
         
-        # Sum only off-diagonal elements (Identity spots are 0 error anyway)
-        # We divide by K*(K-1) to average over pairs, or just sum for stronger gradients
-        loss = weighted_error.sum() / (K * (K - 1) + 1e-8)
+        # Sum off diagonal "errors"
+        loss = weighted_error.sum()
+        
+        if path_normalisation: # Make error invariant to number of concepts by averaging over concept pairs, 
+            loss /= (num_concepts * (num_concepts - 1) + 1e-8)
         
         return loss
     
@@ -411,7 +392,7 @@ class ConceptDecoder(nn.Module):
 
 
         # 3.2) simply enforce feature gammas to be positive
-        gamma_feat = F.softplus(gamma_feat)
+        gamma_feat = F.sigmoid(gamma_feat)
         
         # 3.3) Positive tau
         tau = F.softplus(tau_raw) + self.min_tau
@@ -574,8 +555,9 @@ class EvidenceScorer(nn.Module):
         # Convert tau to logspace
         log_tau = torch.log(concept_prototype.tau)
 
+        final_scores = torch.clamp((total_log_evidence - log_tau), min=-20, max=20)
         # return evidence scores for each concept
-        return (total_log_evidence - log_tau), {
+        return final_scores, {
             "rel": log_relational_similarity,
             "time": log_temporal_similarity,
             "feat": log_feature_similarity,
