@@ -278,7 +278,7 @@ class PredictionHead(nn.Module):
             "activations": activation_tensor,
             "sparsity_loss": sparsity_loss,
             "diversity_loss": div_loss,
-            "discrete_relations": discrete_relations_loss,
+            "discrete_loss": discrete_relations_loss,
             "logic_debug": logic_info
         }
 
@@ -313,13 +313,13 @@ class ConceptDecoder(nn.Module):
         )
         
         # Decoders
-        self.relation_head = nn.Linear(concept_dim * 2, self.L * self.R)
+        self.relation_RNN = nn.Linear(concept_dim * 2 + self.R, self.R)
         self.meta_head = nn.Linear(concept_dim * 2, (self.L * 3) + 1) # Handles (time, gamma_time, gamma_feat, tau)
         self.feature_head = nn.Linear(concept_dim * 2, self.L * self.D)
         
         # Weight initialisation
         self.trunk.apply(self._init_trunk_weights)
-        self.relation_head.apply(self._init_head_weights)
+        self.relation_RNN.apply(self._init_head_weights)
         self.meta_head.apply(self._init_head_weights)
         self.feature_head.apply(self._init_head_weights)
 
@@ -345,38 +345,27 @@ class ConceptDecoder(nn.Module):
 
 
     def forward(self, concept_z):
-        batch_size = concept_z.shape[0]
+        num_concepts = concept_z.shape[0]
         
         # 1) Decode concepts through trunk
         concept_state = self.trunk(concept_z)
         
         # 2.1) Decode Relational matrix logits
-        rel_logits = self.relation_head(concept_state).view(batch_size, self.L, self.R)
-
-        # 2.2) use schema defined reachability matrix to push logit mass towards possible paths
         adj = self.adj.to(concept_z.device)
-        relation_probs = []
+
+        relation_probs = [torch.zeros(num_concepts, self.R).to(concept_z.device)]
+
+        relation_probs[0][:, 0] = 1.0
         
-        # Define new probability matrix
-        curr_prob = torch.zeros(batch_size, self.R).to(concept_z.device)
-        
-        # Always start from root node
-        curr_prob[:, 0] = 1.0
-        relation_probs.append(curr_prob)
-        
-        # sequential masking by hop
-        for l in range(1, self.L):
-            # Calculate reachability based on previous hop: [Batch, R] @ [R, R]
-            reachable = torch.matmul(curr_prob, adj)
-            
-            # Use reachability mask to ensure logit mass isn't applied to unreachable nodes
-            hop_logits = rel_logits[:, l, :]
-            masked_logits = hop_logits.masked_fill(reachable < 1e-6, -1e9)            
-            curr_prob = F.softmax(masked_logits, dim=-1)
-            relation_probs.append(curr_prob)
-            
-        # restack relation matirx
-        relation_matrix = torch.stack(relation_probs, dim=1)
+        for i in range(self.L-1):
+
+            next_rel_prob_logits = self.relation_RNN(torch.cat([concept_state, relation_probs[-1]], dim=-1))
+
+            masked_logits = next_rel_prob_logits.masked_fill(adj[i] == 0, -1e9)
+
+            relation_probs.append(F.gumbel_softmax(masked_logits, tau=1, hard=True))
+
+        relation_matrix = torch.stack(relation_probs, dim = 1)
 
         # 3) Decode time and gamma tensors
         meta_flat = self.meta_head(concept_state)
@@ -399,7 +388,7 @@ class ConceptDecoder(nn.Module):
         
         # 4) Decode prototype feature vectors
         features_flat = self.feature_head(concept_state)
-        features = features_flat.view(batch_size, self.L, self.D)
+        features = features_flat.view(num_concepts, self.L, self.D)
         
         # Keep features as unit vectors for ease of similarity comparison
         features = F.normalize(features, dim=-1)
