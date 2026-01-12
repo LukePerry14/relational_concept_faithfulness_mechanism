@@ -182,26 +182,6 @@ class PredictionHead(nn.Module):
                 print(f"{step_label:<10} | {type_str:<35} | {time_str:<15} | {f_str}")
 
             print(f"{'='*100}\n")
-
-    def concept_diversity_loss(self, rel_proto):
-        """Want to enforce concept sparsity, use rel_proto as first method for this"""
-        
-        # Flatten relational matrix into vector
-        flat_protos = rel_proto.view(self.concepts.shape[0], -1)
-        
-        # Normalize to unit vectors for cosine similarity (dot product)
-        flat_protos = F.normalize(flat_protos, p=2, dim=1)
-        
-        # Compute Similarity Matrix over concept vectors
-        similarity_matrix = torch.matmul(flat_protos, flat_protos.t())
-        
-        # Identity matrix represents perfect concept orthogonality
-        identity = torch.eye(self.concepts.shape[0], device=rel_proto.device)
-        
-        # MSE loss over non diagonal values
-        diversity_loss = torch.mean((similarity_matrix - identity) ** 2)
-        
-        return diversity_loss
     
     def activation_weighted_diversity_loss(self, relation_prototype, time_prototype, feature_prototype, activations):
         """
