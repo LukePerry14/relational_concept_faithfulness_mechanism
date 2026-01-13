@@ -10,7 +10,7 @@ from utils.faithfulness_poc import Subgraph
 from models import PredictionHead
 import random
 import torch.optim as optim
-from concept_dashboard import run_dashboard
+from utils.concept_dashboard import run_dashboard
 
 class SchemaDrivenGenerator:
     def __init__(self, schema, embed_dim):
