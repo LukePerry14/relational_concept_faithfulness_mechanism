@@ -6,218 +6,27 @@ This module handles:
 2. Meta-path enumeration within k-hop neighborhoods
 3. Biased path sampling with temporal constraints
 4. Data storage and loading for training
-
-Phase 1 Implementation for rel-f1 / driver-top3 task
 """
-
+import h5py
 import os
 import json
+import torch
+from torch_geometric.data import HeteroData
 import random
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Set
-from itertools import product
-
 import numpy as np
-
-# Optional imports - will be needed for full pipeline but not core logic
-try:
-    import h5py
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
-
-try:
-    import torch
-    from torch_geometric.data import HeteroData
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    HeteroData = None
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(x, **kwargs):
-        return x
-
-# Import custom dataclasses (these will be copied to the project)
-# For now, define them inline to avoid import issues during development
-
-NodeId = int
-NULL_TOKEN = "∅"
-EPS = 1e-12
-MISSING_TIME = float('inf')
-MISSING_FEAT = float('inf')
-
-
-@dataclass
-class Schema:
-    """
-    Relational schema extracted from a HeteroData graph.
-    
-    Attributes:
-        root_type: The target node type for the prediction task
-        transitions: Dict mapping source node type -> list of reachable destination types
-        node_types: Ordered list of all node types in the schema
-    """
-    root_type: str
-    transitions: Dict[str, List[str]]
-    node_types: List[str] = field(default_factory=list)
-    
-    def __post_init__(self):
-        if not self.node_types:
-            # Collect all unique node types from transitions
-            all_types = set([self.root_type])
-            for src, dsts in self.transitions.items():
-                all_types.add(src)
-                all_types.update(dsts)
-            self.node_types = sorted(list(all_types))
-    
-    def reachability_mask(self, hop_count: int, ordered_node_types: Optional[List[str]] = None) -> np.ndarray:
-        """
-        Build a reachability mask indicating which node types are reachable at each hop.
-        
-        Args:
-            hop_count: Maximum number of hops (path length - 1)
-            ordered_node_types: Optional ordering of node types. If None, uses self.node_types
-            
-        Returns:
-            mask: Array of shape (hop_count + 1, num_types + 1) where +1 is for NULL_TOKEN
-                  mask[h, t] = 1.0 if type t is reachable at hop h
-        """
-        if ordered_node_types is None:
-            ordered_node_types = self.node_types
-            
-        cols = ordered_node_types + [NULL_TOKEN]
-        num_cols = len(cols)
-        
-        mask = np.zeros((hop_count + 1, num_cols), dtype=np.float32)
-        
-        # Hop 0: Only root type (and NULL for padding)
-        root_idx = cols.index(self.root_type) if self.root_type in cols else -1
-        if root_idx >= 0:
-            mask[0, root_idx] = 1.0
-        mask[0, -1] = 1.0  # NULL always allowed
-        
-        # Build reachability for subsequent hops
-        current_types = {self.root_type}
-        
-        for hop in range(1, hop_count + 1):
-            reachable_next = set()
-            for node_type in current_types:
-                reachable_next.update(self.transitions.get(node_type, []))
-            
-            # Mark reachable types
-            for j, t in enumerate(cols):
-                if t in reachable_next or t == NULL_TOKEN:
-                    mask[hop, j] = 1.0
-            
-            current_types = reachable_next.copy()
-        
-        return mask
-    
-    def get_adjacency_matrix(self, ordered_node_types: Optional[List[str]] = None) -> np.ndarray:
-        """
-        Create a type-level adjacency matrix for schema-constrained transitions.
-        
-        Args:
-            ordered_node_types: Optional ordering. If None, uses self.node_types
-            
-        Returns:
-            adj: Array of shape (R+1, R+1) where adj[i,j] = 1 if type i can transition to type j
-        """
-        if ordered_node_types is None:
-            ordered_node_types = self.node_types
-            
-        nodes = ordered_node_types + [NULL_TOKEN]
-        R_plus_1 = len(nodes)
-        adj = np.zeros((R_plus_1, R_plus_1), dtype=np.float32)
-        
-        type_to_idx = {t: i for i, t in enumerate(nodes)}
-        
-        for src, targets in self.transitions.items():
-            if src in type_to_idx:
-                src_idx = type_to_idx[src]
-                for dst in targets:
-                    if dst in type_to_idx:
-                        adj[src_idx, type_to_idx[dst]] = 1.0
-        
-        # NULL token can only transition to itself (absorbing state)
-        null_idx = type_to_idx[NULL_TOKEN]
-        adj[null_idx, null_idx] = 1.0
-        
-        # Every type can transition to NULL (early stopping)
-        for i in range(R_plus_1):
-            adj[i, null_idx] = 1.0
-        
-        return adj
-    
-    def to_dict(self) -> dict:
-        """Serialize schema to dictionary for JSON storage."""
-        return {
-            "root_type": self.root_type,
-            "transitions": self.transitions,
-            "node_types": self.node_types
-        }
-    
-    @classmethod
-    def from_dict(cls, d: dict) -> "Schema":
-        """Deserialize schema from dictionary."""
-        return cls(
-            root_type=d["root_type"],
-            transitions=d["transitions"],
-            node_types=d.get("node_types", [])
-        )
-
-
-@dataclass
-class MetaPathSchema:
-    """
-    Represents a meta-path type (sequence of node types).
-    
-    Example: driver -> results -> races would be:
-        MetaPathSchema(type_sequence=["driver", "results", "races"])
-    """
-    type_sequence: List[str]
-    
-    @property
-    def length(self) -> int:
-        return len(self.type_sequence)
-    
-    def __hash__(self):
-        return hash(tuple(self.type_sequence))
-    
-    def __eq__(self, other):
-        if not isinstance(other, MetaPathSchema):
-            return False
-        return self.type_sequence == other.type_sequence
-    
-    def __repr__(self):
-        return " → ".join(self.type_sequence)
-
-
-@dataclass
-class MetaPath:
-    """
-    A concrete instance of a meta-path with actual node data.
-    
-    Attributes:
-        path_name: Optional identifier
-        node_types: List of node type strings (length L+1, including root)
-        node_times: Array of timestamps (length L+1)
-        node_features: Array of feature vectors (shape L+1 x D)
-        node_ids: Optional list of actual node IDs in the graph
-    """
-    path_name: Optional[str]
-    node_types: List[str]
-    node_times: np.ndarray
-    node_features: np.ndarray
-    node_ids: Optional[List[int]] = None
-    
-    def __repr__(self):
-        types_str = " → ".join(self.node_types)
-        return f"MetaPath({types_str})"
+from tqdm import tqdm
+from utils.custom_dataclasses import (
+    Schema,
+    MetaPath,
+    MetaPathSchema,
+    NULL_TOKEN,
+    EPS,
+    MISSING_TIME,
+    MISSING_FEAT
+)
 
 
 # =============================================================================
@@ -231,17 +40,6 @@ def extract_schema_from_heterodata(
 ) -> Schema:
     """
     Extract a Schema object from a PyG HeteroData graph.
-    
-    The schema captures which node types can transition to which other types
-    based on the edge types present in the graph.
-    
-    Args:
-        data: PyG HeteroData object containing the relational entity graph
-        root_type: The target node type for the prediction task
-        exclude_self_loops: If True, exclude transitions from a type to itself
-        
-    Returns:
-        Schema object with transitions derived from edge types
     """
     transitions = defaultdict(set)
     
@@ -327,7 +125,6 @@ def enumerate_metapath_schemas(
     
     return unique_schemas
 
-
 def print_metapath_schemas(schemas: List[MetaPathSchema], title: str = "Meta-path Schemas"):
     """Pretty-print enumerated meta-path schemas."""
     print(f"\n{'='*60}")
@@ -347,11 +144,6 @@ def print_metapath_schemas(schemas: List[MetaPathSchema], title: str = "Meta-pat
     print(f"\nTotal: {len(schemas)} unique meta-path schemas")
     print(f"{'='*60}\n")
 
-
-# =============================================================================
-# Path Sampling with Temporal Constraints
-# =============================================================================
-
 class MetaPathSampler:
     """
     Samples concrete meta-path instances from a HeteroData graph.
@@ -367,7 +159,8 @@ class MetaPathSampler:
         data: HeteroData,
         schema: Schema,
         max_hops: int,
-        metapath_schemas: Optional[List[MetaPathSchema]] = None
+        metapath_schemas: Optional[List[MetaPathSchema]] = None,
+        adjacency: Optional[Dict] = None
     ):
         """
         Initialize the sampler.
@@ -387,9 +180,11 @@ class MetaPathSampler:
             self.metapath_schemas = enumerate_metapath_schemas(schema, max_hops)
         else:
             self.metapath_schemas = metapath_schemas
-        
-        # Build adjacency lists for efficient neighbor lookup
-        self._build_adjacency()
+
+        if adjacency is not None:
+            self.adjacency = adjacency
+        else:
+            self._build_adjacency()
         
         # Get feature dimension from data
         self.feature_dim = self._get_feature_dim()
@@ -480,7 +275,7 @@ class MetaPathSampler:
         seed_type: str,
         seed_idx: int,
         seed_time: float,
-        n_samples_per_schema: int = 4,
+        n_samples_per_metapath_schema: int = 4,
         max_total_samples: int = 64,
         rng: Optional[np.random.Generator] = None
     ) -> Tuple[List[MetaPath], Dict[MetaPathSchema, int]]:
@@ -520,7 +315,7 @@ class MetaPathSampler:
                 mp_schema,
                 seed_idx,
                 seed_time,
-                n_samples=n_samples_per_schema,
+                n_samples=n_samples_per_metapath_schema,
                 rng=rng
             )
             
@@ -672,14 +467,3 @@ class MetaPathSampler:
                 selected.extend([schema_paths[i] for i in idxs])
         
         return selected
-
-
-# =============================================================================
-# Testing / Demonstration
-# =============================================================================
-
-if __name__ == "__main__":
-    # This block will be used for testing once we integrate with RelBench
-    print("Data Pipeline Module - Phase 1")
-    print("This module provides schema extraction and meta-path sampling utilities.")
-    print("\nTo test with RelBench data, run the integration script.")

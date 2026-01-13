@@ -1,485 +1,399 @@
 """
-CBM Dataset for Concept Bottleneck Model Training
+CBM Dataset for Concept Bottleneck Model Training on RelBench
 
-This module provides a PyTorch Dataset class that:
-1. Loads precomputed meta-path samples for each seed node
-2. Provides batching with proper collation
-3. Integrates with the PredictionHead from models.py
-
-Compatible with both mock data (for testing) and real RelBench data.
+This module provides a dataset class similar to RelGTTokens but for meta-path sampling
+needed by the Concept Bottleneck Model. Reuses existing infrastructure where possible.
 """
-
 import os
-import json
+import gc
+from typing import List, Tuple, Optional, Dict
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Any
-from pathlib import Path
-
+from multiprocessing import Pool, cpu_count
+from relbench.modeling.graph import get_node_train_table_input
 import numpy as np
+import h5py
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from torch import Tensor
 
-# Optional imports
-try:
-    import torch
-    from torch.utils.data import Dataset as TorchDataset
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
-    TorchDataset = object
+from torch_geometric.data import HeteroData
 
-try:
-    import h5py
-    HAS_H5PY = True
-except ImportError:
-    HAS_H5PY = False
-
-try:
-    import torch.nn.functional as F
-except ImportError:
-    F = None
-
-from data_pipeline import (
-    Schema,
-    MetaPath,
-    MetaPathSchema,
-    MetaPathSampler,
-    enumerate_metapath_schemas,
-    NULL_TOKEN,
-    MISSING_TIME,
-    MISSING_FEAT
-)
+from data_handling import extract_schema_from_heterodata, enumerate_metapath_schemas, MetaPathSampler
+from utils.custom_dataclasses import NULL_TOKEN, MISSING_TIME, MISSING_FEAT
 
 
-@dataclass
-class CBMConfig:
-    """Configuration for CBM Dataset."""
-    max_hops: int = 2
-    n_samples_per_schema: int = 4
-    max_paths_per_seed: int = 64
-    feature_dim: int = 128
-    cache_dir: str = ".cache/cbm"
-    precompute: bool = True
+class GloveTextEmbedding:
+    def __init__(self, device: torch.device):
+        self.model = SentenceTransformer("sentence-transformers/average_word_embeddings_glove.6B.300d", device=device)
+    
+    def __call__(self, sentences: List[str]) -> Tensor:
+        return torch.from_numpy(self.model.encode(sentences))
 
+def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
+    """Taken from Rel-GT github repo"""
+    adjacency = {
+        node_type: [set() for _ in range(hetero_data[node_type].num_nodes)]
+        for node_type in hetero_data.node_types
+    }
+    for edge_type in hetero_data.edge_types:
+        src_type, _, dst_type = edge_type
+        if 'edge_index' not in hetero_data[edge_type]:
+            continue
+        edge_index = hetero_data[edge_type].edge_index
+        src_list = edge_index[0].tolist()
+        dst_list = edge_index[1].tolist()
+        for s, d in zip(src_list, dst_list):
+            adjacency[src_type][s].add((dst_type, d))
+            if undirected:
+                adjacency[dst_type][d].add((src_type, s))
+    return adjacency
 
-class CBMDataset(TorchDataset):
+GLOBAL_PATH_SAMPLER = None
+GLOBAL_NODE_TYPE = None
+GLOBAL_SCHEMA = None
+
+def init_worker(path_sampler, node_type, schema):
+    """Initialize worker process with shared objects"""
+    global GLOBAL_PATH_SAMPLER, GLOBAL_NODE_TYPE, GLOBAL_SCHEMA
+    GLOBAL_PATH_SAMPLER = path_sampler
+    GLOBAL_NODE_TYPE = node_type
+    GLOBAL_SCHEMA = schema
+
+def process_seed(args):
     """
-    Dataset for Concept Bottleneck Model training on relational data.
+    Worker function to process one seed node.
+    Returns paths sampled for this seed.
+    """
+    global GLOBAL_PATH_SAMPLER, GLOBAL_NODE_TYPE, GLOBAL_SCHEMA
     
-    This dataset:
-    - Samples meta-paths from a relational entity graph
-    - Stores precomputed samples in HDF5 for efficiency
-    - Provides batched tensors compatible with EvidenceScorer
+    node_id, seed_time, seed_val, n_samples_per_metapath_schema, max_total_samples = args
     
-    The output format matches what the PredictionHead expects:
-    - relations: [batch, n_paths, max_hops+1, num_types+1] one-hot
-    - times: [batch, n_paths, max_hops+1] relative timestamps
-    - features: [batch, n_paths, max_hops+1, feature_dim] node features
+    # Set seed for reproducibility
+    rng = np.random.default_rng(seed=seed_val)
+    
+    # Sample paths
+    paths, schema_counts = GLOBAL_PATH_SAMPLER.sample_paths_for_seed(
+        seed_type=GLOBAL_NODE_TYPE,
+        seed_idx=int(node_id),
+        seed_time=seed_time,
+        n_samples_per_metapath_schema=n_samples_per_metapath_schema,
+        max_total_samples=max_total_samples,
+        rng=rng
+    )
+    
+    return paths
+
+class CBMTokens(Dataset):
+    """
+    Pytorch-geometric  Dataset wrapper for sampling meta-paths for Concept Bottleneck Model training.
+    
+    Reuses code from rel-GT github
     """
     
     def __init__(
         self,
-        schema: Schema,
-        node_types: List[str],
-        seed_indices: List[int],
-        seed_times: Optional[List[float]] = None,
-        labels: Optional[List[Any]] = None,
-        config: Optional[CBMConfig] = None,
-        sampler: Optional[MetaPathSampler] = None,
+        data: HeteroData,
+        task,
         split: str = "train",
-        precomputed_paths: Optional[Dict[int, List[MetaPath]]] = None
+        max_hops: int = 3,
+        n_paths_per_seed: int = 64,
+        n_samples_per_metapath_schema: int = 4,
+        precompute: bool = True,
+        precomputed_dir: str = None,
+        num_workers: int = None,
+        undirected: bool = True,
     ):
-        """
-        Initialize the CBM Dataset.
-        
-        Args:
-            schema: Relational schema
-            node_types: Ordered list of node types (for one-hot encoding)
-            seed_indices: List of seed node indices
-            seed_times: Optional timestamps for each seed
-            labels: Optional labels for supervised training
-            config: Dataset configuration
-            sampler: MetaPathSampler for generating paths (required if not precomputed)
-            split: Data split name (train/val/test)
-            precomputed_paths: Optional precomputed paths dict
-        """
         super().__init__()
-        
-        self.schema = schema
-        self.node_types = node_types
-        self.seed_indices = seed_indices
-        self.seed_times = seed_times if seed_times is not None else [float('inf')] * len(seed_indices)
-        self.labels = labels
-        self.config = config or CBMConfig()
-        self.sampler = sampler
+        self.data = data
+        self.task = task
         self.split = split
+        self.max_hops = max_hops
+        self.n_paths_per_seed = n_paths_per_seed
+        self.n_samples_per_metapath_schema = n_samples_per_metapath_schema
+        self.undirected = undirected
+        self.num_workers = num_workers
+        self.precompute = precompute
+        self.precomputed_dir = precomputed_dir
+
+        # Get training table
+        self.table = self.task.get_table(split=self.split)
+        self.table_input = get_node_train_table_input(self.table, self.task)
+        self.node_type, self.node_idxs = self.table_input.nodes
+        self.target = self.table_input.target if self.table_input.target is not None else None
+        self.time = getattr(self.table_input, "time", None)
         
-        # Build type-to-index mapping (including NULL token)
-        self.type_to_idx = {t: i for i, t in enumerate(node_types)}
-        self.type_to_idx[NULL_TOKEN] = len(node_types)
-        self.num_types = len(node_types) + 1  # +1 for NULL
+        # Extract schema
+        print(f"Extracting schema for root type: {self.node_type}")
+        self.schema = extract_schema_from_heterodata(
+            self.data,
+            root_type=self.node_type,
+            exclude_self_loops=True
+        )
         
-        # Path storage
-        self.paths_by_seed: Dict[int, List[MetaPath]] = precomputed_paths or {}
+        # Enumerate metapath schemas
+        print(f"Enumerating metapath schemas up to {self.max_hops} hops...")
+        self.metapath_schemas = enumerate_metapath_schemas(
+            self.schema,
+            max_hops=self.max_hops
+        )
+        print(f"Found {len(self.metapath_schemas)} metapath schemas")
         
-        # Precompute or load paths
-        if not self.paths_by_seed:
-            self._initialize_paths()
+        # Build adjacency
+        print("Building adjacency list...")
+        self.adjacency = build_adjacency_hetero(self.data, undirected=self.undirected)
+        
+        # Create path sampler
+        self.path_sampler = MetaPathSampler(
+            data=self.data,
+            schema=self.schema,
+            metapath_schemas=self.metapath_schemas,
+            max_hops=self.max_hops,
+            adjacency=self.adjacency,
+        )
+        
+        # Type mappings
+        self.node_types = self.data.node_types
+        self.type_to_idx = {nt: idx for idx, nt in enumerate(self.node_types)}
+        self.type_to_idx[NULL_TOKEN] = len(self.node_types)
+        self.num_types = len(self.node_types) + 1
+        
+        # HDF5 path
+        self.precomputed_path = self._construct_precomputed_path()
+        
+        if self.precompute:
+            if os.path.exists(self.precomputed_path):
+                print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
+            else:
+                print(f"[{self.split}] Precomputing path sampling...")
+                self._precompute_paths()
+
     
-    def _initialize_paths(self):
-        """Initialize path storage, either by loading or computing."""
-        cache_path = self._get_cache_path()
+    def _construct_precomputed_path(self) -> str:
+        if not self.precomputed_dir:
+            raise ValueError("must provide a 'precomputed_dir' to store paths.")
+        path = os.path.join(
+            self.precomputed_dir,
+            f"hops{self.max_hops}_paths{self.n_paths_per_seed}",
+            f"{self.split}.h5"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+    
+    def __len__(self):
+        return len(self.node_idxs)
+    
+    def _get_smart_chunk_size(self, total_samples: int) -> int:
+        """
+        Calculate chunk size that balances:
+        1. Progress update frequency
+        2. HDF5 write efficiency
+        3. Memory usage
         
-        if self.config.precompute and os.path.exists(cache_path):
-            print(f"[{self.split}] Loading precomputed paths from {cache_path}")
-            self._load_paths(cache_path)
-        elif self.sampler is not None:
-            print(f"[{self.split}] Computing paths for {len(self.seed_indices)} seeds...")
-            self._compute_and_save_paths(cache_path)
+        Strategy from RelGT:
+        - Use fixed chunk size for HDF5 (good for I/O)
+        - But update progress per chunk (good for visibility)
+        """
+        # For HDF5 chunking: use min(total, 10000) like RelGT
+        hdf5_chunk = min(total_samples, 10000)
+
+        # For processing chunks: smaller if dataset is small
+        if total_samples <= 500:
+            processing_chunk = 50  # Update every 50 samples
+        elif total_samples <= 2000:
+            processing_chunk = 100  # Update every 100 samples
+        elif total_samples <= 10000:
+            processing_chunk = 500  # Update every 500 samples
         else:
-            raise ValueError("Either provide precomputed_paths or a sampler")
-    
-    def _get_cache_path(self) -> str:
-        """Get the cache file path."""
-        cache_dir = Path(self.config.cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return str(cache_dir / f"{self.split}_paths.json")
-    
-    def _compute_and_save_paths(self, cache_path: str):
-        """Compute paths for all seeds and save to cache."""
-        rng = np.random.default_rng(42)
-        
-        for i, (seed_idx, seed_time) in enumerate(zip(self.seed_indices, self.seed_times)):
-            paths, _ = self.sampler.sample_paths_for_seed(
-                seed_type=self.schema.root_type,
-                seed_idx=seed_idx,
-                seed_time=seed_time,
-                n_samples_per_schema=self.config.n_samples_per_schema,
-                max_total_samples=self.config.max_paths_per_seed,
-                rng=rng
-            )
-            self.paths_by_seed[seed_idx] = paths
+            processing_chunk = 1000  # Update every 1000 samples
             
-            if (i + 1) % 100 == 0:
-                print(f"  Processed {i+1}/{len(self.seed_indices)} seeds")
-        
-        # Save to cache
-        if self.config.precompute:
-            self._save_paths(cache_path)
+        return hdf5_chunk, processing_chunk
     
-    def _save_paths(self, cache_path: str):
-        """Save paths to JSON cache."""
-        data = {}
-        for seed_idx, paths in self.paths_by_seed.items():
-            data[str(seed_idx)] = [
-                {
-                    "node_types": p.node_types,
-                    "node_times": p.node_times.tolist(),
-                    "node_features": p.node_features.tolist()
-                }
-                for p in paths
-            ]
-        
-        with open(cache_path, 'w') as f:
-            json.dump(data, f)
-        print(f"  Saved paths to {cache_path}")
-    
-    def _load_paths(self, cache_path: str):
-        """Load paths from JSON cache."""
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-        
-        for seed_idx_str, path_dicts in data.items():
-            seed_idx = int(seed_idx_str)
-            paths = []
-            for pd in path_dicts:
-                paths.append(MetaPath(
-                    path_name=None,
-                    node_types=pd["node_types"],
-                    node_times=np.array(pd["node_times"], dtype=np.float32),
-                    node_features=np.array(pd["node_features"], dtype=np.float32)
-                ))
-            self.paths_by_seed[seed_idx] = paths
-    
-    def __len__(self) -> int:
-        return len(self.seed_indices)
-    
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, Any], Optional[Any]]:
+    def _precompute_paths(self):
         """
-        Get a single sample.
+        Precompute paths for all seeds and store in HDF5.
         
-        Returns:
-            sample: Dict with 'relations', 'times', 'features' tensors
-            label: Optional label for this sample
+        Storage format:
+        - For each seed, store multiple paths
+        - Each path has: types, times, features (all padded to max_hops+1)
+        - Store as variable-length dataset per seed
         """
-        seed_idx = self.seed_indices[idx]
-        seed_time = self.seed_times[idx]
-        paths = self.paths_by_seed.get(seed_idx, [])
+        total = len(self.node_idxs)
+        hdf5_chunk_size, processing_chunk_size = self._get_smart_chunk_size(total)
         
-        # Convert paths to tensors
-        sample = self._paths_to_tensors(paths, seed_time)
+        print(f"Processing {total} samples:")
+        print(f"  - HDF5 chunk size: {hdf5_chunk_size}")
+        print(f"  - Processing chunk size: {processing_chunk_size}")
+        print(f"  - Progress updates every {processing_chunk_size} samples")
         
-        # Get label if available
-        label = self.labels[idx] if self.labels is not None else None
+        max_paths = self.n_paths_per_seed
+        path_len = self.max_hops + 1
+
+        with h5py.File(self.precomputed_path, 'w') as hf:
+            # Create datasets with HDF5 chunking
+            path_types_dset = hf.create_dataset(
+                "path_types",
+                shape=(total, max_paths, path_len),
+                dtype='int16',
+                chunks=(hdf5_chunk_size, max_paths, path_len),
+                compression='gzip',
+                compression_opts=4
+            )
+            path_indices_dset = hf.create_dataset(
+                "path_node_indices",
+                shape=(total, max_paths, path_len),
+                dtype='int32',
+                chunks=(hdf5_chunk_size, max_paths, path_len),
+                compression='gzip',
+                compression_opts=4
+            )
+            path_times_dset = hf.create_dataset(
+                "path_times",
+                shape=(total, max_paths, path_len),
+                dtype='float32',
+                chunks=(hdf5_chunk_size, max_paths, path_len),
+                compression='gzip',
+                compression_opts=4
+            )
+            path_n_paths_dset = hf.create_dataset(
+                "path_n_paths",
+                shape=(total,),
+                dtype='int16',
+                chunks=(hdf5_chunk_size,)
+            )
+            
+            # Store metadata
+            hf.attrs['max_hops'] = self.max_hops
+            hf.attrs['n_paths_per_seed'] = self.n_paths_per_seed
+            hf.attrs['split'] = self.split
+            hf.attrs['node_type'] = self.node_type
+            
+            # Process in chunks with proper progress tracking
+            # KEY FIX: Wrap outer loop with tqdm like RelGT does
+            with tqdm(total=total, desc=f"Precomputing '{self.split}'") as pbar:
+                for start_idx in range(0, total, processing_chunk_size):
+                    end_idx = min(start_idx + processing_chunk_size, total)
+                    size_chunk = end_idx - start_idx
+                    
+                    # Prepare tasks for this chunk
+                    tasks = []
+                    for i in range(start_idx, end_idx):
+                        node_idx_t = self.node_idxs[i]
+                        node_idx = node_idx_t.item() if hasattr(node_idx_t, 'item') else int(node_idx_t)
+                        
+                        seed_time = self.time[i].item() if self.time is not None else float('inf')
+                        seed_val = hash((self.node_type, node_idx, seed_time, self.n_paths_per_seed)) & 0xffffffff
+                        
+                        tasks.append((
+                            node_idx,
+                            seed_time,
+                            seed_val,
+                            self.n_samples_per_metapath_schema,
+                            max_paths
+                        ))
+                    
+                    # Process chunk with multiprocessing or sequential
+                    if self.num_workers is not None and self.num_workers > 1:
+                        num_workers_actual = min(self.num_workers, size_chunk, cpu_count() - 2)
+                        num_workers_actual = max(1, num_workers_actual)
+                        
+                        with Pool(
+                            processes=num_workers_actual,
+                            initializer=init_worker,
+                            initargs=(self.path_sampler, self.node_type, self.schema)
+                        ) as pool:
+                            chunk_results = pool.map(process_seed, tasks)
+                    else:
+                        # Sequential processing - initialize globals first!
+                        init_worker(self.path_sampler, self.node_type, self.schema)
+                        chunk_results = [process_seed(t) for t in tasks]
+                    
+                    # Convert results to padded arrays
+                    c_types = np.full((size_chunk, max_paths, path_len), -1, dtype=np.int16)
+                    c_indices = np.full((size_chunk, max_paths, path_len), -1, dtype=np.int32)
+                    c_times = np.full((size_chunk, max_paths, path_len), MISSING_TIME, dtype=np.float32)
+                    c_n_paths = np.zeros(size_chunk, dtype=np.int16)
+                    
+                    for i, paths in enumerate(chunk_results):
+                        n_paths = min(len(paths), max_paths)
+                        c_n_paths[i] = n_paths
+                        
+                        for p in range(n_paths):
+                            path = paths[p]
+                            
+                            for l in range(min(len(path.node_types), path_len)):
+                                node_type = path.node_types[l]
+                                node_id = path.node_ids[l]
+                                node_time = path.node_times[l]
+                                
+                                type_idx = self.type_to_idx.get(node_type, self.num_types - 1)
+                                c_types[i, p, l] = type_idx
+                                c_indices[i, p, l] = node_id
+                                c_times[i, p, l] = node_time
+                    
+                    # Write chunk to HDF5
+                    path_types_dset[start_idx:end_idx] = c_types
+                    path_indices_dset[start_idx:end_idx] = c_indices
+                    path_times_dset[start_idx:end_idx] = c_times
+                    path_n_paths_dset[start_idx:end_idx] = c_n_paths
+                    
+                    # Update progress by chunk size
+                    pbar.update(size_chunk)
+                    
+                    # Cleanup
+                    del chunk_results
+                    gc.collect()
         
+        print(f"\n✓ Precomputation complete: {self.precomputed_path}")
+    
+    def __getitem__(self, idx: int):
+        """Retrieve samples from HDF5 and the label from self.target"""
+        with h5py.File(self.precomputed_path, 'r') as hf:
+            sample = {
+                "path_types": torch.from_numpy(hf["path_types"][idx]).long(),
+                "path_indices": torch.from_numpy(hf["path_node_indices"][idx]).long(),
+                "path_times": torch.from_numpy(hf["path_times"][idx]).float(),
+                "global_idx": idx,
+            }
+        
+        label = self.target[idx] if self.target is not None else None
         return sample, label
     
-    def _paths_to_tensors(self, paths: List[MetaPath], seed_time: float) -> Dict[str, Any]:
-        """
-        Convert a list of MetaPaths to tensor format.
-        
-        Args:
-            paths: List of MetaPath objects
-            seed_time: Seed node timestamp for relative time computation
-            
-        Returns:
-            Dict with:
-                - relations: [n_paths, max_hops+1, num_types] one-hot
-                - times: [n_paths, max_hops+1] relative times
-                - features: [n_paths, max_hops+1, feature_dim] features
-        """
-        n_paths = len(paths)
-        path_len = self.config.max_hops + 1
-        
-        if n_paths == 0:
-            # Return empty tensors
-            if HAS_TORCH:
-                return {
-                    'relations': torch.zeros(1, path_len, self.num_types),
-                    'times': torch.full((1, path_len), MISSING_TIME),
-                    'features': torch.full((1, path_len, self.config.feature_dim), MISSING_FEAT)
-                }
-            else:
-                return {
-                    'relations': np.zeros((1, path_len, self.num_types), dtype=np.float32),
-                    'times': np.full((1, path_len), MISSING_TIME, dtype=np.float32),
-                    'features': np.full((1, path_len, self.config.feature_dim), MISSING_FEAT, dtype=np.float32)
-                }
-        
-        # Get feature dimension from first path
-        feat_dim = paths[0].node_features.shape[1] if len(paths[0].node_features.shape) > 1 else self.config.feature_dim
-        
-        # Initialize arrays
-        relations = np.zeros((n_paths, path_len, self.num_types), dtype=np.float32)
-        times = np.full((n_paths, path_len), MISSING_TIME, dtype=np.float32)
-        features = np.full((n_paths, path_len, feat_dim), MISSING_FEAT, dtype=np.float32)
-        
-        for i, path in enumerate(paths):
-            # One-hot encode node types
-            for j, node_type in enumerate(path.node_types[:path_len]):
-                type_idx = self.type_to_idx.get(node_type, self.num_types - 1)
-                relations[i, j, type_idx] = 1.0
-            
-            # Relative times (relative to seed = root node)
-            root_time = path.node_times[0]
-            for j in range(min(len(path.node_times), path_len)):
-                if path.node_times[j] != MISSING_TIME and root_time != MISSING_TIME:
-                    if np.isfinite(path.node_times[j]) and np.isfinite(root_time):
-                        times[i, j] = path.node_times[j] - root_time
-                    else:
-                        times[i, j] = 0.0  # Same time if root has no time
-            
-            # Features
-            for j in range(min(len(path.node_features), path_len)):
-                if not np.any(np.isinf(path.node_features[j])):
-                    features[i, j] = path.node_features[j]
-        
-        if HAS_TORCH:
-            return {
-                'relations': torch.from_numpy(relations),
-                'times': torch.from_numpy(times),
-                'features': torch.from_numpy(features)
-            }
-        else:
-            return {
-                'relations': relations,
-                'times': times,
-                'features': features
-            }
-    
-    @staticmethod
-    def collate_fn(batch: List[Tuple[Dict[str, Any], Any]]) -> Tuple[Dict[str, Any], Any]:
-        """
-        Collate function for DataLoader.
-        
-        Handles variable numbers of paths per sample by padding to max.
-        
-        Args:
-            batch: List of (sample_dict, label) tuples
-            
-        Returns:
-            batched_sample: Dict with batched tensors
-            batched_labels: Stacked labels tensor
-        """
+    def collate(self, batch: List[Tuple[dict, Optional[torch.Tensor]]]):
+        """Collate function for DataLoader"""
         samples, labels = zip(*batch)
         
-        # Find max paths in this batch
-        max_paths = max(s['relations'].shape[0] for s in samples)
+        path_types = torch.stack([s["path_types"] for s in samples], dim=0)
+        path_indices = torch.stack([s["path_indices"] for s in samples], dim=0)
+        path_times = torch.stack([s["path_times"] for s in samples], dim=0)
+        global_idxs = torch.tensor([s["global_idx"] for s in samples], dtype=torch.long)
         
-        batched = {}
+        out = {
+            "path_types": path_types,
+            "path_indices": path_indices,
+            "path_times": path_times,
+            "global_idx": global_idxs,
+        }
         
-        for key in ['relations', 'times', 'features']:
-            tensors = []
-            for s in samples:
-                t = s[key]
-                n_paths = t.shape[0]
-                
-                if n_paths < max_paths:
-                    # Pad with zeros/inf
-                    if HAS_TORCH:
-                        if key == 'relations':
-                            pad = torch.zeros(max_paths - n_paths, *t.shape[1:])
-                        else:
-                            pad = torch.full((max_paths - n_paths, *t.shape[1:]), 
-                                           MISSING_TIME if key == 'times' else MISSING_FEAT)
-                        t = torch.cat([t, pad], dim=0)
-                    else:
-                        if key == 'relations':
-                            pad = np.zeros((max_paths - n_paths, *t.shape[1:]), dtype=np.float32)
-                        else:
-                            pad = np.full((max_paths - n_paths, *t.shape[1:]), 
-                                        MISSING_TIME if key == 'times' else MISSING_FEAT, dtype=np.float32)
-                        t = np.concatenate([t, pad], axis=0)
-                
-                tensors.append(t)
-            
-            if HAS_TORCH:
-                batched[key] = torch.stack(tensors, dim=0)
-            else:
-                batched[key] = np.stack(tensors, axis=0)
-        
-        # Handle labels
-        if labels[0] is not None:
-            if HAS_TORCH:
-                batched_labels = torch.tensor(labels)
-            else:
-                batched_labels = np.array(labels)
+        if self.target is not None:
+            out["labels"] = torch.stack(labels, dim=0)
         else:
-            batched_labels = None
+            out["labels"] = None
         
-        return batched, batched_labels
-
-
-def create_cbm_datasets_from_mock(
-    mock_data,
-    schema: Schema,
-    config: CBMConfig,
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15
-) -> Tuple[CBMDataset, CBMDataset, CBMDataset]:
-    """
-    Create train/val/test CBM datasets from mock data.
-    
-    Args:
-        mock_data: MockHeteroData instance
-        schema: Schema object
-        config: CBMConfig
-        train_ratio: Fraction for training
-        val_ratio: Fraction for validation
-        
-    Returns:
-        train_dataset, val_dataset, test_dataset
-    """
-    from test_mock_relf1 import MockMetaPathSampler
-    
-    # Get all driver indices
-    num_drivers = mock_data._node_counts["driver"]
-    all_indices = list(range(num_drivers))
-    
-    # Create mock labels (random binary for testing)
-    rng = np.random.default_rng(42)
-    all_labels = rng.integers(0, 2, num_drivers).tolist()
-    
-    # Create mock times
-    all_times = [float('inf')] * num_drivers  # No temporal constraint for drivers
-    
-    # Split indices
-    rng.shuffle(all_indices)
-    n_train = int(len(all_indices) * train_ratio)
-    n_val = int(len(all_indices) * val_ratio)
-    
-    train_idx = all_indices[:n_train]
-    val_idx = all_indices[n_train:n_train + n_val]
-    test_idx = all_indices[n_train + n_val:]
-    
-    # Create sampler
-    sampler = MockMetaPathSampler(mock_data, schema, max_hops=config.max_hops)
-    
-    # Create datasets
-    datasets = []
-    for split, indices in [("train", train_idx), ("val", val_idx), ("test", test_idx)]:
-        ds = CBMDataset(
-            schema=schema,
-            node_types=schema.node_types,
-            seed_indices=indices,
-            seed_times=[all_times[i] for i in indices],
-            labels=[all_labels[i] for i in indices],
-            config=config,
-            sampler=sampler,
-            split=split
-        )
-        datasets.append(ds)
-    
-    return tuple(datasets)
+        return out
 
 
 # =============================================================================
-# Testing
+# Testing Code
 # =============================================================================
-
-def test_cbm_dataset():
-    """Test CBMDataset with mock data."""
-    print("\n" + "=" * 60)
-    print("CBMDataset Test")
-    print("=" * 60)
-    
-    # Import mock utilities
-    from test_mock_relf1 import create_mock_f1_schema, MockHeteroData
-    
-    # Create mock data
-    schema = create_mock_f1_schema()
-    mock_data = MockHeteroData(num_drivers=50, num_races=20)
-    
-    # Configuration
-    config = CBMConfig(
-        max_hops=2,
-        n_samples_per_schema=2,
-        max_paths_per_seed=16,
-        feature_dim=64,
-        cache_dir="/tmp/cbm_test",
-        precompute=False  # Don't cache for test
-    )
-    
-    # Create datasets
-    print("\nCreating datasets...")
-    train_ds, val_ds, test_ds = create_cbm_datasets_from_mock(
-        mock_data, schema, config,
-        train_ratio=0.6, val_ratio=0.2
-    )
-    
-    print(f"\nDataset sizes: train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
-    
-    # Test single item access
-    print("\nTesting single item access...")
-    sample, label = train_ds[0]
-    print(f"  Relations shape: {sample['relations'].shape}")
-    print(f"  Times shape: {sample['times'].shape}")
-    print(f"  Features shape: {sample['features'].shape}")
-    print(f"  Label: {label}")
-    
-    # Test batching
-    print("\nTesting batching...")
-    batch_samples = [train_ds[i] for i in range(4)]
-    batched, labels = CBMDataset.collate_fn(batch_samples)
-    
-    print(f"  Batched relations shape: {batched['relations'].shape}")
-    print(f"  Batched times shape: {batched['times'].shape}")
-    print(f"  Batched features shape: {batched['features'].shape}")
-    print(f"  Labels shape: {labels.shape if HAS_TORCH else labels.shape}")
-    
-    print("\n" + "=" * 60)
-    print("CBMDataset test passed!")
-    print("=" * 60)
-
 
 if __name__ == "__main__":
-    test_cbm_dataset()
+    """
+    Quick test to make sure the class can be instantiated.
+    For full testing, use test_cbm_dataset.py
+    """
+    print("CBMTokens dataset class loaded successfully")
+    print("\nTo test with real data, use:")
+    print("  from cbm_dataset import CBMTokens")
+    print("  dataset = CBMTokens(data, task, split='train', ...)")

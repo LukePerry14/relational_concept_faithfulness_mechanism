@@ -7,6 +7,8 @@ NodeId = int
 NULL_TOKEN = "∅"
 EPS = 1e-12
 DEFAULT_TAU = 0.5
+MISSING_TIME = float('inf')
+MISSING_FEAT = float('inf')
 
 @dataclass(frozen=True)
 class Node:
@@ -15,18 +17,25 @@ class Node:
     time: float
     feature: np.ndarray  # shape (D,)
 
-
 @dataclass(frozen=True)
 class Edge:
     src: NodeId
     dst: NodeId
     relation: str
 
-
 @dataclass
 class Schema:
     root_type: str
-    transitions: Dict[str, List[str]] # src_type -> [dst_types].
+    transitions: Dict[str, List[str]]
+    node_types: List[str] = field(default_factory=list)
+    
+    def __post_init__(self): # populate sorted nodetype list after initialisation using tranistion datastructure
+        if not self.node_types:
+            all_types = set([self.root_type])
+            for src, dsts in self.transitions.items():
+                all_types.add(src)
+                all_types.update(dsts)
+            self.node_types = sorted(list(all_types))
 
     def reachability_mask(self, hop_count, ordered_node_types, zeroed=False):
         """
@@ -94,12 +103,27 @@ class Schema:
 
         return adj
 
+    def to_dict(self):
+        return {
+            "root_type": self.root_type,
+            "transitions": self.transitions,
+            "node_types": self.node_types
+        }
+
+    def from_dict(cls, d):
+        return cls(
+            root_type=d["root_type"],
+            transitions=d["transitions"],
+            node_types=d.get("node_types", [])
+        )
+
 @dataclass
 class MetaPath:
     path_name: Optional[str]
     node_types: List[str]
     node_times: np.ndarray
     node_features: np.ndarray
+    node_ids: Optional[List[int]]
 
     def __repr__(self):
         return (
@@ -108,10 +132,35 @@ class MetaPath:
             f"  node_types={self.node_types},\n"
             f"  node_times={self.node_times},\n"
             f"  node_features={self.node_features}\n"
+            f"  node_ids={self.node_ids}\n"
             f")"
         )
 
-
+@dataclass
+class MetaPathSchema:
+    """
+    Represents a meta-path type (sequence of node types).
+    
+    Example: driver -> results -> races would be:
+        MetaPathSchema(type_sequence=["driver", "results", "races"])
+    """
+    type_sequence: List[str]
+    
+    @property
+    def length(self) -> int:
+        return len(self.type_sequence)
+    
+    def __hash__(self):
+        return hash(tuple(self.type_sequence))
+    
+    def __eq__(self, other):
+        if not isinstance(other, MetaPathSchema):
+            return False
+        return self.type_sequence == other.type_sequence
+    
+    def __repr__(self):
+        return " → ".join(self.type_sequence)
+    
 @dataclass
 class Concept:
     name: str
